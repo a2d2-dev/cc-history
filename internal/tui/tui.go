@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/a2d2-dev/cc-history/internal/config"
 	"github.com/a2d2-dev/cc-history/internal/parser"
 )
 
@@ -145,12 +146,13 @@ func RunSession(session *parser.Session) error {
 }
 
 func newModelMulti(sessions []*parser.Session, idx int) model {
+	cfg := config.Load()
 	m := model{
 		sessions:       sessions,
 		sessionIdx:     idx,
 		expanded:       make(map[int]bool),
 		expandedGroups: make(map[string]bool),
-		showTools:      true,
+		showTools:      cfg.ShowTools,
 		height:         24,
 		width:          80,
 	}
@@ -234,15 +236,20 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "t":
 		m.showTools = !m.showTools
+		cfg := config.Load()
+		cfg.ShowTools = m.showTools
+		config.Save(cfg) //nolint:errcheck // best-effort persistence
 		m.rebuildItems()
 		m.clampCursor()
 
 	case "T":
-		msgIdx := m.focusedMsgIndex()
-		if msgIdx >= 0 {
-			m.expanded[msgIdx] = !m.expanded[msgIdx]
-			m.rebuildItems()
-			m.clampCursor()
+		if m.showTools {
+			msgIdx := m.focusedMsgIndex()
+			if msgIdx >= 0 {
+				m.expanded[msgIdx] = !m.expanded[msgIdx]
+				m.rebuildItems()
+				m.clampCursor()
+			}
 		}
 
 	case "s":
