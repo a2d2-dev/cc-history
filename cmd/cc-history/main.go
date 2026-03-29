@@ -118,7 +118,7 @@ func main() {
 		if isFallback {
 			fmt.Fprintf(os.Stderr, "note: CLAUDE_SESSION_ID not set — opening most recent session\n")
 		}
-		if err := tui.RunTUI(sessions, currentIdx); err != nil {
+		if err := tui.RunTUI(sessions, currentIdx, root); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
