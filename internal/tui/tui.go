@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -43,6 +44,7 @@ const (
 	modeNormal tuiMode = iota
 	modePicker         // session list overlay
 	modeSearch         // inline search
+	modeInfo           // session info modal
 )
 
 // --------------------------------------------------------------------------
@@ -180,6 +182,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updatePicker(msg)
 		case modeSearch:
 			return m.updateSearch(msg)
+		case modeInfo:
+			return m.updateInfo(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -264,6 +268,10 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.matchCursor = (m.matchCursor - 1 + len(m.matches)) % len(m.matches)
 			m.scrollToMatch()
 		}
+
+	case "i":
+		m.mode = modeInfo
+		m.showHelp = false
 	}
 	return m, nil
 }
@@ -400,6 +408,16 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) updateInfo(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "i", "q":
+		m.mode = modeNormal
+	}
+	return m, nil
+}
+
 // recomputeMatches finds all items matching the current searchQuery.
 func (m *model) recomputeMatches() {
 	m.matches = nil
@@ -442,6 +460,8 @@ func (m model) View() string {
 			return m.groupedPickerView()
 		}
 		return m.pickerView()
+	case modeInfo:
+		return m.infoModalView()
 	default:
 		if m.showHelp {
 			return m.helpView()
@@ -514,7 +534,7 @@ func (m model) statusBar() string {
 		if len(m.sessions) > 1 {
 			sessionInfo = fmt.Sprintf(" s list · Tab grouped(%d)", len(m.sessions))
 		}
-		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · t toggle tools · / search%s · ? help · q quit", sessionInfo))
+		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · t toggle tools · / search · i info%s · ? help · q quit", sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", pct))
@@ -610,6 +630,7 @@ func (m model) helpView() string {
 		"  g / Home     go to top",
 		"  G / End      go to bottom",
 		"  t            toggle tool calls for focused message",
+		"  i            show session info modal",
 		"  s            open flat session list",
 		"  Tab          open grouped session list (by directory)",
 		"  /            enter search mode",
@@ -630,6 +651,116 @@ func (m model) helpView() string {
 		body += "\n"
 	}
 	return body + "\n" + styleHelp.Render("press ? to close help")
+}
+
+// infoModalView renders a centered overlay with session metadata.
+func (m model) infoModalView() string {
+	sess := m.session()
+	if sess == nil {
+		return m.mainView()
+	}
+
+	// Compute session stats.
+	var firstTs, lastTs time.Time
+	msgCount := 0
+	cwd := ""
+	for _, msg := range sess.Messages {
+		if msg.Role == "" {
+			continue
+		}
+		msgCount++
+		if !msg.Timestamp.IsZero() {
+			if firstTs.IsZero() || msg.Timestamp.Before(firstTs) {
+				firstTs = msg.Timestamp
+			}
+			if msg.Timestamp.After(lastTs) {
+				lastTs = msg.Timestamp
+			}
+		}
+		if cwd == "" && msg.CWD != "" {
+			cwd = msg.CWD
+		}
+	}
+
+	fmtTs := func(t time.Time) string {
+		if t.IsZero() {
+			return "(unknown)"
+		}
+		return t.Format("2006-01-02 15:04:05")
+	}
+	if cwd == "" {
+		cwd = "(unknown)"
+	}
+
+	rows := []struct{ label, value string }{
+		{"Session ID", sess.ID},
+		{"Project path", abbrevPath(cwd)},
+		{"File path", sess.FilePath},
+		{"Created", fmtTs(firstTs)},
+		{"Last message", fmtTs(lastTs)},
+		{"Messages", fmt.Sprintf("%d", msgCount)},
+	}
+
+	// Calculate modal width.
+	labelW := 0
+	valueW := 0
+	for _, r := range rows {
+		if len(r.label) > labelW {
+			labelW = len(r.label)
+		}
+		if len(r.value) > valueW {
+			valueW = len(r.value)
+		}
+	}
+	maxValue := m.width - labelW - 7 // padding + border
+	if maxValue < 20 {
+		maxValue = 20
+	}
+
+	var bodyLines []string
+	for _, r := range rows {
+		val := r.value
+		if len(val) > maxValue {
+			val = "…" + val[len(val)-maxValue+1:]
+		}
+		line := fmt.Sprintf("  %-*s  %s", labelW, r.label, styleUser.Render(val))
+		bodyLines = append(bodyLines, line)
+	}
+
+	title := styleHeader.Render("Session Info")
+	sep := styleBorder.Render(strings.Repeat("─", labelW+valueW+6))
+	modalLines := []string{"", "  " + title, "  " + sep, ""}
+	for _, l := range bodyLines {
+		modalLines = append(modalLines, l)
+	}
+	modalLines = append(modalLines, "")
+
+	// Render over main view — replace center lines.
+	main := m.mainView()
+	mainLines := strings.Split(main, "\n")
+	vh := m.viewHeight()
+
+	modalHeight := len(modalLines)
+	startRow := (vh - modalHeight) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+
+	for i, ml := range modalLines {
+		row := startRow + i
+		if row >= len(mainLines) {
+			break
+		}
+		// Pad modal line to full width for clean overlay.
+		plain := stripANSI(ml)
+		pad := m.width - len([]rune(plain))
+		if pad < 0 {
+			pad = 0
+		}
+		mainLines[row] = ml + strings.Repeat(" ", pad)
+	}
+
+	return strings.Join(mainLines, "\n")
 }
 
 // --------------------------------------------------------------------------
