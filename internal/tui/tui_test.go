@@ -266,11 +266,109 @@ func TestHelpModalContextAware(t *testing.T) {
 	}
 }
 
+func TestShowToolsToggle(t *testing.T) {
+	tc := &parser.ToolCall{ID: "1", Name: "ReadFile", Arguments: `{"path":"/tmp/x"}`}
+	msg := &parser.Message{
+		Role:      "assistant",
+		Text:      "using tool",
+		Timestamp: time.Now(),
+		ToolCalls: []*parser.ToolCall{tc},
+	}
+	s := makeSession([]*parser.Message{msg})
+	m := newModel(s)
+
+	if !m.showTools {
+		t.Fatal("showTools should default to true")
+	}
+	countVisible := m.totalLines
+
+	// Press t — hide tools.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	m = updated.(model)
+	if m.showTools {
+		t.Error("showTools should be false after t")
+	}
+	if m.totalLines >= countVisible {
+		t.Errorf("expected fewer items when tools hidden (%d >= %d)", m.totalLines, countVisible)
+	}
+
+	// Press t again — show tools.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	m = updated.(model)
+	if !m.showTools {
+		t.Error("showTools should be true after second t")
+	}
+	if m.totalLines != countVisible {
+		t.Errorf("expected same item count after restore (%d != %d)", m.totalLines, countVisible)
+	}
+}
+
+func TestCapitalTExpandsDetails(t *testing.T) {
+	tc := &parser.ToolCall{ID: "1", Name: "ReadFile", Arguments: `{"path":"/tmp/x"}`}
+	msg := &parser.Message{
+		Role:      "assistant",
+		Text:      "using tool",
+		Timestamp: time.Now(),
+		ToolCalls: []*parser.ToolCall{tc},
+	}
+	s := makeSession([]*parser.Message{msg})
+	m := newModel(s)
+	m.height = 40 // ensure message is in viewport
+	m.rebuildItems()
+
+	countBefore := m.totalLines
+
+	// Press T — should expand details for focused message.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("T")})
+	m = updated.(model)
+	if m.totalLines <= countBefore {
+		t.Errorf("expected more items after T expand (%d <= %d)", m.totalLines, countBefore)
+	}
+}
+
+func TestEditDiffRendering(t *testing.T) {
+	tc := &parser.ToolCall{
+		ID:        "1",
+		Name:      "Edit",
+		Arguments: `{"file_path":"/tmp/foo.go","old_string":"old line","new_string":"new line"}`,
+	}
+	msg := &parser.Message{
+		Role:      "assistant",
+		Text:      "editing",
+		Timestamp: time.Now(),
+		ToolCalls: []*parser.ToolCall{tc},
+	}
+	s := makeSession([]*parser.Message{msg})
+	m := newModel(s)
+	m.expanded[0] = true
+	m.rebuildItems()
+
+	full := strings.Join(collectPlains(m.items), "\n")
+	if !strings.Contains(full, "-old line") {
+		t.Error("expected '-old line' in Edit diff output")
+	}
+	if !strings.Contains(full, "+new line") {
+		t.Error("expected '+new line' in Edit diff output")
+	}
+	if !strings.Contains(full, "file: /tmp/foo.go") {
+		t.Error("expected file path in Edit diff output")
+	}
+}
+
 // collectTexts extracts all item texts.
 func collectTexts(items []item) []string {
 	out := make([]string, len(items))
 	for i, it := range items {
 		out[i] = it.text
+	}
+	return out
+}
+
+// collectPlains extracts all item plain texts.
+func collectPlains(items []item) []string {
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.plain
 	}
 	return out
 }
