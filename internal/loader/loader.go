@@ -7,7 +7,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
+
+	"github.com/a2d2-dev/cc-history/internal/parser"
 )
 
 // JSONLFile holds a path and its modification time.
@@ -161,4 +164,39 @@ func FindCurrentSession(root string) (path string, isFallback bool, err error) {
 		}
 	}
 	return newest.Path, true, nil
+}
+
+// LoadAllSessions parses every JSONL file under root and returns all sessions
+// sorted by their earliest message timestamp (oldest first).
+// Files that cannot be parsed are silently skipped.
+func LoadAllSessions(root string) ([]*parser.Session, error) {
+	paths, err := ScanJSONL(root)
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]*parser.Session, 0, len(paths))
+	for _, p := range paths {
+		s, err := parser.ParseFile(p)
+		if err != nil {
+			continue
+		}
+		sessions = append(sessions, s)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		ti := firstMessageTime(sessions[i])
+		tj := firstMessageTime(sessions[j])
+		return ti.Before(tj)
+	})
+	return sessions, nil
+}
+
+// firstMessageTime returns the timestamp of the first message with a non-zero
+// time in session, or the zero time if none exist.
+func firstMessageTime(s *parser.Session) time.Time {
+	for _, m := range s.Messages {
+		if !m.Timestamp.IsZero() {
+			return m.Timestamp
+		}
+	}
+	return time.Time{}
 }
