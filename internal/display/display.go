@@ -17,6 +17,26 @@ const (
 	argMaxRunes     = 80
 )
 
+// UseColors enables ANSI color output. Set to true when stdout is a terminal.
+var UseColors bool
+
+// ANSI color codes.
+const (
+	colorReset  = "\033[0m"
+	colorCyan   = "\033[36m"   // user role
+	colorYellow = "\033[33m"   // assistant role
+	colorRed    = "\033[31m"   // tool errors
+	colorBold   = "\033[1m"    // session header
+	colorDim    = "\033[2m"    // session header separator
+)
+
+func colorize(code, s string) string {
+	if !UseColors {
+		return s
+	}
+	return code + s + colorReset
+}
+
 // PrintSession writes all messages in session to w in chronological order.
 // A session header is printed first, then each message on its own line(s).
 // Format per line: [HH:MM:SS]  role  summary
@@ -59,8 +79,9 @@ func printSessionHeader(w io.Writer, session *parser.Session) {
 		}
 	}
 
-	fmt.Fprintf(w, "─── session %s  %s  %d messages  %s\n",
+	header := fmt.Sprintf("─── session %s  %s  %d messages  %s",
 		idStr, session.FilePath, count, timeRange)
+	fmt.Fprintln(w, colorize(colorBold+colorDim, header))
 }
 
 func printMessage(w io.Writer, msg *parser.Message) {
@@ -94,7 +115,7 @@ func printMessage(w io.Writer, msg *parser.Message) {
 					if name == "" {
 						name = tr.ToolUseID
 					}
-					fmt.Fprintf(w, "[%s]  %s  [tool error: %s]\n", ts, role, name)
+					fmt.Fprintf(w, "[%s]  %s  %s\n", ts, role, colorize(colorRed, "[tool error: "+name+"]"))
 				}
 			}
 			return
@@ -110,13 +131,13 @@ func printMessage(w io.Writer, msg *parser.Message) {
 	}
 }
 
-// formatRole returns a fixed-width role label.
+// formatRole returns a fixed-width role label, optionally colorized.
 func formatRole(role string) string {
 	switch role {
 	case "user":
-		return "user"
+		return colorize(colorCyan, "user")
 	case "assistant":
-		return "asst"
+		return colorize(colorYellow, "asst")
 	default:
 		r := role
 		if utf8.RuneCountInString(r) > 4 {

@@ -14,7 +14,19 @@ import (
 
 const version = "0.1.0"
 
+// isTerminal reports whether f is connected to a terminal.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func main() {
+	// Enable ANSI colors when stdout is a terminal.
+	display.UseColors = isTerminal(os.Stdout)
+
 	// Top-level flags.
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	pathFlag := flag.String("path", "", "session directory (default: ~/.claude/projects)")
