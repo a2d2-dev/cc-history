@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/a2d2-dev/cc-history/internal/parser"
@@ -17,11 +18,49 @@ const (
 )
 
 // PrintSession writes all messages in session to w in chronological order.
+// A session header is printed first, then each message on its own line(s).
 // Format per line: [HH:MM:SS]  role  summary
 func PrintSession(w io.Writer, session *parser.Session) {
+	printSessionHeader(w, session)
 	for _, msg := range session.Messages {
 		printMessage(w, msg)
 	}
+}
+
+// printSessionHeader prints a compact one-line summary of the session.
+func printSessionHeader(w io.Writer, session *parser.Session) {
+	// Collect timestamps to compute time range.
+	var first, last time.Time
+	count := 0
+	for _, m := range session.Messages {
+		if m.Role == "" {
+			continue
+		}
+		count++
+		if first.IsZero() || m.Timestamp.Before(first) {
+			first = m.Timestamp
+		}
+		if m.Timestamp.After(last) {
+			last = m.Timestamp
+		}
+	}
+
+	idStr := session.ID
+	if len(idStr) > 8 {
+		idStr = idStr[:8]
+	}
+
+	var timeRange string
+	if !first.IsZero() {
+		if first.Format("2006-01-02") == last.Format("2006-01-02") {
+			timeRange = first.Format("2006-01-02 15:04:05") + " – " + last.Format("15:04:05")
+		} else {
+			timeRange = first.Format("2006-01-02 15:04") + " – " + last.Format("2006-01-02 15:04")
+		}
+	}
+
+	fmt.Fprintf(w, "─── session %s  %s  %d messages  %s\n",
+		idStr, session.FilePath, count, timeRange)
 }
 
 func printMessage(w io.Writer, msg *parser.Message) {
@@ -32,10 +71,11 @@ func printMessage(w io.Writer, msg *parser.Message) {
 
 	ts := msg.Timestamp.Format("15:04:05")
 	role := formatRole(msg.Role)
+	hasText := strings.TrimSpace(msg.Text) != ""
 
 	// Print text summary if present.
-	if text := strings.TrimSpace(msg.Text); text != "" {
-		fmt.Fprintf(w, "[%s]  %s  %s\n", ts, role, truncate(text, summaryMaxRunes))
+	if hasText {
+		fmt.Fprintf(w, "[%s]  %s  %s\n", ts, role, truncate(strings.TrimSpace(msg.Text), summaryMaxRunes))
 	}
 
 	// Print each tool call on its own line.
@@ -43,8 +83,29 @@ func printMessage(w io.Writer, msg *parser.Message) {
 		fmt.Fprintf(w, "[%s]  %s  [%s %s]\n", ts, role, tc.Name, formatArgs(tc.Arguments))
 	}
 
-	// If no text and no tool calls, still emit a blank-content line.
-	if strings.TrimSpace(msg.Text) == "" && len(msg.ToolCalls) == 0 {
+	// For messages with no text and no tool calls:
+	if !hasText && len(msg.ToolCalls) == 0 {
+		// User messages that consist only of tool_result blocks: show errors,
+		// skip successful results (already visible via the assistant tool-call line).
+		if msg.Role == "user" && len(msg.ToolResults) > 0 {
+			for _, tr := range msg.ToolResults {
+				if tr.IsError {
+					name := tr.ToolName
+					if name == "" {
+						name = tr.ToolUseID
+					}
+					fmt.Fprintf(w, "[%s]  %s  [tool error: %s]\n", ts, role, name)
+				}
+			}
+			return
+		}
+
+		// Assistant messages that contain only thinking blocks: skip silently.
+		if msg.Role == "assistant" && msg.HasThinking {
+			return
+		}
+
+		// Fallback: emit a placeholder so truly empty messages are visible.
 		fmt.Fprintf(w, "[%s]  %s  (no content)\n", ts, role)
 	}
 }

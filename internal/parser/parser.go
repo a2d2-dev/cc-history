@@ -85,6 +85,8 @@ type Message struct {
 	ToolCalls []*ToolCall
 	// ToolResults is populated for user messages that return tool output.
 	ToolResults []*ToolResult
+	// HasThinking is true when the message contained at least one thinking block.
+	HasThinking bool
 	// TurnDurationMs is set for system/turn_duration records.
 	TurnDurationMs float64
 }
@@ -103,6 +105,7 @@ type ToolCall struct {
 // ToolResult is the output of a tool call, found in a user message.
 type ToolResult struct {
 	ToolUseID  string
+	ToolName   string // populated during link pass from matching ToolCall
 	Content    string
 	IsError    bool
 	DurationMs float64
@@ -174,12 +177,14 @@ func ParseReader(filePath string, r io.Reader) (*Session, error) {
 		return nil, fmt.Errorf("scan %s: %w", filePath, err)
 	}
 
-	// Link pass: populate ToolCall.Result/IsError/DurationMs from matching results.
+	// Link pass: populate ToolCall.Result/IsError/DurationMs from matching results,
+	// and back-fill ToolResult.ToolName from the matching ToolCall.
 	for id, tr := range toolResultMap {
 		if tc, ok := toolCallMap[id]; ok {
 			tc.Result = tr.Content
 			tc.IsError = tr.IsError
 			tc.DurationMs = tr.DurationMs
+			tr.ToolName = tc.Name
 		}
 	}
 
@@ -267,7 +272,9 @@ func parseContent(msg *Message, rec *rawRecord) {
 					IsError:    item.IsError,
 					DurationMs: dur,
 				})
-			// "thinking" blocks are internal reasoning; skip.
+			case "thinking":
+				// Internal reasoning; do not extract text, but mark presence.
+				msg.HasThinking = true
 			}
 		}
 		msg.Text = strings.Join(textParts, "\n")
