@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/a2d2-dev/cc-history/internal/parser"
 )
 
@@ -201,6 +203,66 @@ func TestPickerMode(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "Sessions") {
 		t.Error("picker view should show 'Sessions' header")
+	}
+}
+
+func TestHelpModal(t *testing.T) {
+	s := makeSession([]*parser.Message{makeMsg("user", "hello")})
+	m := newModel(s)
+
+	// ? key should switch to modeHelp.
+	if m.mode != modeNormal {
+		t.Fatalf("expected modeNormal, got %d", m.mode)
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	m = updated.(model)
+	if m.mode != modeHelp {
+		t.Errorf("expected modeHelp after ?, got %d", m.mode)
+	}
+
+	// View should contain keyboard shortcut content.
+	view := m.View()
+	if !strings.Contains(view, "keyboard shortcuts") {
+		t.Error("help modal view should contain 'keyboard shortcuts'")
+	}
+	if !strings.Contains(view, "View mode") {
+		t.Error("help modal should contain 'View mode' section")
+	}
+
+	// Esc should close the modal.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	if m.mode != modeNormal {
+		t.Errorf("expected modeNormal after Esc, got %d", m.mode)
+	}
+
+	// ? again should close (toggle).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	m = updated.(model)
+	if m.mode != modeNormal {
+		t.Errorf("expected modeNormal after ?+?, got %d", m.mode)
+	}
+}
+
+func TestHelpModalContextAware(t *testing.T) {
+	// Single session: no "Session list" section.
+	s := makeSession([]*parser.Message{makeMsg("user", "hi")})
+	m := newModel(s)
+	m.mode = modeHelp
+	view := m.View()
+	if strings.Contains(view, "Session list") {
+		t.Error("single-session help should not show 'Session list' section")
+	}
+
+	// Multiple sessions: "Session list" section should appear.
+	s2 := makeSession([]*parser.Message{makeMsg("user", "bye")})
+	m2 := newModelMulti([]*parser.Session{s, s2}, 0)
+	m2.mode = modeHelp
+	view2 := m2.View()
+	if !strings.Contains(view2, "Session list") {
+		t.Error("multi-session help should show 'Session list' section")
 	}
 }
 

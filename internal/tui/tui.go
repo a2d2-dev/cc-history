@@ -45,6 +45,7 @@ const (
 	modePicker         // session list overlay
 	modeSearch         // inline search
 	modeInfo           // session info modal
+	modeHelp           // help modal overlay
 )
 
 // --------------------------------------------------------------------------
@@ -89,7 +90,6 @@ type model struct {
 	cursor     int          // viewport top line index
 	height     int          // terminal height
 	width      int          // terminal width
-	showHelp   bool
 	totalLines int
 
 	// search
@@ -184,6 +184,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateSearch(msg)
 		case modeInfo:
 			return m.updateInfo(msg)
+		case modeHelp:
+			return m.updateHelp(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -197,7 +199,7 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "?":
-		m.showHelp = !m.showHelp
+		m.mode = modeHelp
 
 	case "up", "k":
 		if m.cursor > 0 {
@@ -239,7 +241,6 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = modePicker
 			m.groupedPicker = false
 			m.pickCursor = m.sessionIdx
-			m.showHelp = false
 		}
 
 	case "tab":
@@ -247,7 +248,6 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = modePicker
 			m.groupedPicker = true
 			m.buildGroupRows()
-			m.showHelp = false
 		}
 
 	case "/":
@@ -255,7 +255,6 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.searchQuery = ""
 		m.matches = nil
 		m.matchCursor = 0
-		m.showHelp = false
 
 	case "n":
 		if len(m.matches) > 0 {
@@ -271,7 +270,6 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "i":
 		m.mode = modeInfo
-		m.showHelp = false
 	}
 	return m, nil
 }
@@ -418,6 +416,16 @@ func (m model) updateInfo(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "?", "q":
+		m.mode = modeNormal
+	}
+	return m, nil
+}
+
 // recomputeMatches finds all items matching the current searchQuery.
 func (m *model) recomputeMatches() {
 	m.matches = nil
@@ -462,10 +470,9 @@ func (m model) View() string {
 		return m.pickerView()
 	case modeInfo:
 		return m.infoModalView()
+	case modeHelp:
+		return m.helpModalView()
 	default:
-		if m.showHelp {
-			return m.helpView()
-		}
 		return m.mainView()
 	}
 }
@@ -618,39 +625,91 @@ func sessionLabel(s *parser.Session) string {
 	return fmt.Sprintf("[%s]  %s", ts, preview)
 }
 
-func (m model) helpView() string {
-	lines := []string{
-		styleHeader.Render("cc-history TUI — keyboard shortcuts"),
-		styleBorder.Render(strings.Repeat("─", 40)),
-		"",
-		"  ↑ / k        scroll up",
-		"  ↓ / j        scroll down",
-		"  PgUp / b     scroll up one page",
-		"  PgDn / f     scroll down one page",
-		"  g / Home     go to top",
-		"  G / End      go to bottom",
-		"  t            toggle tool calls for focused message",
-		"  i            show session info modal",
-		"  s            open flat session list",
-		"  Tab          open grouped session list (by directory)",
-		"  /            enter search mode",
-		"  n / N        next / previous search match",
-		"  ?            toggle this help",
-		"  q            quit",
-		"",
-		styleDim.Render("  In session list:"),
-		styleDim.Render("  Tab           toggle flat / grouped view"),
-		styleDim.Render("  ←/→/Enter     expand / collapse group (grouped view)"),
-		styleDim.Render("  Enter         select session"),
-		styleDim.Render("  Esc / q       close list"),
+// helpModalView renders a centered help overlay showing all keybindings.
+// Content is context-aware: view-mode shortcuts are listed first, then
+// session-list shortcuts are shown only when multiple sessions are loaded.
+func (m model) helpModalView() string {
+	sep := styleBorder.Render(strings.Repeat("─", 42))
+
+	type entry struct{ key, desc string }
+	viewKeys := []entry{
+		{"↑ / k", "scroll up"},
+		{"↓ / j", "scroll down"},
+		{"PgUp / b / C-u", "scroll up one page"},
+		{"PgDn / f / C-d", "scroll down one page"},
+		{"g / Home", "go to top"},
+		{"G / End", "go to bottom"},
+		{"t", "toggle tool calls for focused message"},
+		{"i", "show session info"},
+		{"s", "open flat session list"},
+		{"Tab", "open grouped session list"},
+		{"/", "enter search mode"},
+		{"n / N", "next / previous search match"},
+		{"?", "close this help"},
+		{"q / Q", "quit"},
 	}
-	body := strings.Join(lines, "\n")
+	listKeys := []entry{
+		{"↑ / k", "move cursor up"},
+		{"↓ / j", "move cursor down"},
+		{"Enter", "select session"},
+		{"Esc / q", "close list"},
+	}
+	searchKeys := []entry{
+		{"type", "add to query"},
+		{"Backspace", "delete last char"},
+		{"Enter", "confirm and return to view"},
+		{"Esc", "cancel search"},
+	}
+
+	renderSection := func(title string, entries []entry) []string {
+		out := []string{"  " + styleHeader.Render(title)}
+		for _, e := range entries {
+			line := fmt.Sprintf("  %-18s %s", e.key, e.desc)
+			out = append(out, line)
+		}
+		return out
+	}
+
+	var modalLines []string
+	modalLines = append(modalLines, "")
+	modalLines = append(modalLines, "  "+styleHeader.Render("cc-history — keyboard shortcuts"))
+	modalLines = append(modalLines, "  "+sep)
+	modalLines = append(modalLines, "")
+	modalLines = append(modalLines, renderSection("View mode", viewKeys)...)
+	if len(m.sessions) > 1 {
+		modalLines = append(modalLines, "")
+		modalLines = append(modalLines, "  "+sep)
+		modalLines = append(modalLines, renderSection("Session list  (s)", listKeys)...)
+	}
+	modalLines = append(modalLines, "")
+	modalLines = append(modalLines, "  "+sep)
+	modalLines = append(modalLines, renderSection("Search mode  (/)", searchKeys)...)
+	modalLines = append(modalLines, "")
+
+	// Overlay modal on top of main view.
+	main := m.mainView()
+	mainLines := strings.Split(main, "\n")
 	vh := m.viewHeight()
-	bodyLines := strings.Count(body, "\n") + 1
-	for i := bodyLines; i < vh; i++ {
-		body += "\n"
+
+	startRow := (vh - len(modalLines)) / 2
+	if startRow < 0 {
+		startRow = 0
 	}
-	return body + "\n" + styleHelp.Render("press ? to close help")
+
+	for i, ml := range modalLines {
+		row := startRow + i
+		if row >= len(mainLines) {
+			break
+		}
+		plain := stripANSI(ml)
+		pad := m.width - len([]rune(plain))
+		if pad < 0 {
+			pad = 0
+		}
+		mainLines[row] = ml + strings.Repeat(" ", pad)
+	}
+
+	return strings.Join(mainLines, "\n")
 }
 
 // infoModalView renders a centered overlay with session metadata.
