@@ -17,6 +17,7 @@ func main() {
 	// Top-level flags.
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	pathFlag := flag.String("path", "", "session directory (default: ~/.claude/projects)")
+	regexFlag := flag.Bool("E", false, "treat pattern as extended regular expression")
 	flag.Parse()
 
 	if *versionFlag {
@@ -47,7 +48,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	display.PrintSession(os.Stdout, session)
+	pattern := flag.Arg(0)
+	if pattern == "" {
+		display.PrintSession(os.Stdout, session)
+		return
+	}
+
+	if err := display.FilterSession(os.Stdout, session, pattern, *regexFlag); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // runExport handles the "export" subcommand.
