@@ -1,4 +1,7 @@
-# CC History - Product Requirements Document
+> **⚠️ 此文件已归档（Legacy v1.4.0）。**
+> 当前权威 PRD 请参阅：[`_bmad-output/planning-artifacts/prd.md`](../../_bmad-output/planning-artifacts/prd.md)
+
+# CC History - Product Requirements Document（历史归档）
 
 ## 文档信息
 
