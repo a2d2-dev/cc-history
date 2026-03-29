@@ -146,7 +146,7 @@ func FilterAllSessions(w io.Writer, sessions []*parser.Session, pattern string, 
 	}
 	visible := make([]visEntry, 0, len(all))
 	for i, sm := range all {
-		if sm.msg.Role != "" {
+		if sm.msg.Role != "" && opts.inDateRange(sm.msg.Timestamp) {
 			visible = append(visible, visEntry{idx: i, session: sm.session})
 		}
 	}

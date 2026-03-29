@@ -193,3 +193,113 @@ func TestFilterSession_contextFlag(t *testing.T) {
 		t.Error("unexpected 'gap'")
 	}
 }
+
+func TestFilterSession_sinceFilter(t *testing.T) {
+	day := func(s string) time.Time {
+		t, _ := time.Parse("2006-01-02", s)
+		return t.UTC()
+	}
+
+	session := &parser.Session{ID: "test", Messages: []*parser.Message{
+		{Role: "user", Text: "old message", Timestamp: day("2024-01-01")},
+		{Role: "assistant", Text: "old reply", Timestamp: day("2024-01-02")},
+		{Role: "user", Text: "new message", Timestamp: day("2024-03-01")},
+		{Role: "assistant", Text: "new reply", Timestamp: day("2024-03-02")},
+	}}
+
+	var sb strings.Builder
+	opts := FilterOptions{Since: day("2024-02-01")}
+	if err := FilterSession(&sb, session, "", opts); err != nil {
+		t.Fatal(err)
+	}
+	out := sb.String()
+
+	if strings.Contains(out, "old message") || strings.Contains(out, "old reply") {
+		t.Errorf("messages before --since should be excluded:\n%s", out)
+	}
+	if !strings.Contains(out, "new message") || !strings.Contains(out, "new reply") {
+		t.Errorf("messages after --since should be included:\n%s", out)
+	}
+}
+
+func TestFilterSession_untilFilter(t *testing.T) {
+	day := func(s string) time.Time {
+		t, _ := time.Parse("2006-01-02", s)
+		return t.UTC()
+	}
+
+	session := &parser.Session{ID: "test", Messages: []*parser.Message{
+		{Role: "user", Text: "old message", Timestamp: day("2024-01-01")},
+		{Role: "user", Text: "new message", Timestamp: day("2024-03-01")},
+	}}
+
+	var sb strings.Builder
+	opts := FilterOptions{Until: day("2024-02-01")}
+	if err := FilterSession(&sb, session, "", opts); err != nil {
+		t.Fatal(err)
+	}
+	out := sb.String()
+
+	if !strings.Contains(out, "old message") {
+		t.Errorf("messages before --until should be included:\n%s", out)
+	}
+	if strings.Contains(out, "new message") {
+		t.Errorf("messages after --until should be excluded:\n%s", out)
+	}
+}
+
+func TestFilterSession_sinceUntilWithPattern(t *testing.T) {
+	day := func(s string) time.Time {
+		t, _ := time.Parse("2006-01-02", s)
+		return t.UTC()
+	}
+
+	session := &parser.Session{ID: "test", Messages: []*parser.Message{
+		{Role: "user", Text: "target old", Timestamp: day("2024-01-01")},
+		{Role: "user", Text: "target new", Timestamp: day("2024-03-01")},
+		{Role: "user", Text: "other new", Timestamp: day("2024-03-02")},
+	}}
+
+	var sb strings.Builder
+	opts := FilterOptions{Since: day("2024-02-01")}
+	if err := FilterSession(&sb, session, "target", opts); err != nil {
+		t.Fatal(err)
+	}
+	out := sb.String()
+
+	if strings.Contains(out, "target old") {
+		t.Errorf("old matching message should be excluded by --since:\n%s", out)
+	}
+	if !strings.Contains(out, "target new") {
+		t.Errorf("new matching message should be included:\n%s", out)
+	}
+	if strings.Contains(out, "other new") {
+		t.Errorf("non-matching new message should be excluded:\n%s", out)
+	}
+}
+
+func TestInDateRange(t *testing.T) {
+	day := func(s string) time.Time {
+		t, _ := time.Parse("2006-01-02", s)
+		return t.UTC()
+	}
+
+	opts := FilterOptions{Since: day("2024-02-01"), Until: day("2024-02-29")}
+
+	cases := []struct {
+		ts      string
+		inRange bool
+	}{
+		{"2024-01-31", false}, // before since
+		{"2024-02-01", true},  // exactly since
+		{"2024-02-15", true},  // within
+		{"2024-02-29", true},  // exactly until
+		{"2024-03-01", false}, // after until
+	}
+	for _, c := range cases {
+		got := opts.inDateRange(day(c.ts))
+		if got != c.inRange {
+			t.Errorf("inDateRange(%s) = %v, want %v", c.ts, got, c.inRange)
+		}
+	}
+}

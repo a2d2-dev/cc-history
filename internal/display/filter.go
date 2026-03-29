@@ -5,6 +5,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/a2d2-dev/cc-history/internal/parser"
 )
@@ -29,6 +30,28 @@ type FilterOptions struct {
 	Before int
 	// After is the number of context messages to show after each match (-A).
 	After int
+	// Since restricts output to messages at or after this date (inclusive, UTC day).
+	// Zero value means no lower bound.
+	Since time.Time
+	// Until restricts output to messages at or before this date (inclusive, UTC day).
+	// Zero value means no upper bound.
+	Until time.Time
+}
+
+// inDateRange reports whether t falls within the Since–Until window.
+// The Until bound is inclusive for the full calendar day (UTC).
+func (o FilterOptions) inDateRange(t time.Time) bool {
+	if !o.Since.IsZero() && t.Before(o.Since) {
+		return false
+	}
+	if !o.Until.IsZero() {
+		// Until is end-of-day inclusive: accept anything before the start of the next day.
+		endOfDay := o.Until.Add(24 * time.Hour)
+		if !t.Before(endOfDay) {
+			return false
+		}
+	}
+	return true
 }
 
 // FilterSession writes only messages that match pattern to w.
@@ -43,10 +66,10 @@ func FilterSession(w io.Writer, session *parser.Session, pattern string, opts Fi
 
 	msgs := session.Messages
 
-	// Build a slice of "visible" indices (messages with a role).
+	// Build a slice of "visible" indices (messages with a role, within date range).
 	visible := make([]int, 0, len(msgs))
 	for i, m := range msgs {
-		if m.Role != "" {
+		if m.Role != "" && opts.inDateRange(m.Timestamp) {
 			visible = append(visible, i)
 		}
 	}
