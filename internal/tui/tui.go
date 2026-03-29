@@ -32,6 +32,8 @@ var (
 	styleMatch     = lipgloss.NewStyle().Background(lipgloss.Color("3")).Foreground(lipgloss.Color("0"))  // yellow bg
 	stylePickSel   = lipgloss.NewStyle().Background(lipgloss.Color("4")).Foreground(lipgloss.Color("15")) // blue bg
 	stylePickBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	styleRemoved   = lipgloss.NewStyle().Foreground(lipgloss.Color("1")) // red  (diff -)
+	styleAdded     = lipgloss.NewStyle().Foreground(lipgloss.Color("2")) // green (diff +)
 )
 
 // --------------------------------------------------------------------------
@@ -86,7 +88,8 @@ type model struct {
 	sessions   []*parser.Session
 	sessionIdx int
 	items      []item
-	expanded   map[int]bool // msgIndex -> expanded (tool calls)
+	expanded   map[int]bool // msgIndex -> expanded (tool call details)
+	showTools  bool         // whether tool call lines are visible at all
 	cursor     int          // viewport top line index
 	height     int          // terminal height
 	width      int          // terminal width
@@ -147,6 +150,7 @@ func newModelMulti(sessions []*parser.Session, idx int) model {
 		sessionIdx:     idx,
 		expanded:       make(map[int]bool),
 		expandedGroups: make(map[string]bool),
+		showTools:      true,
 		height:         24,
 		width:          80,
 	}
@@ -228,7 +232,12 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "end", "G":
 		m.cursor = m.maxCursor()
 
-	case "t", "T":
+	case "t":
+		m.showTools = !m.showTools
+		m.rebuildItems()
+		m.clampCursor()
+
+	case "T":
 		msgIdx := m.focusedMsgIndex()
 		if msgIdx >= 0 {
 			m.expanded[msgIdx] = !m.expanded[msgIdx]
@@ -541,7 +550,11 @@ func (m model) statusBar() string {
 		if len(m.sessions) > 1 {
 			sessionInfo = fmt.Sprintf(" s list · Tab grouped(%d)", len(m.sessions))
 		}
-		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · t toggle tools · / search · i info%s · ? help · q quit", sessionInfo))
+		toolsHint := "t hide tools"
+		if !m.showTools {
+			toolsHint = "t show tools"
+		}
+		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", pct))
@@ -639,7 +652,8 @@ func (m model) helpModalView() string {
 		{"PgDn / f / C-d", "scroll down one page"},
 		{"g / Home", "go to top"},
 		{"G / End", "go to bottom"},
-		{"t", "toggle tool calls for focused message"},
+		{"t", "hide / show all tool calls"},
+		{"T", "expand / collapse tool details for focused message"},
 		{"i", "show session info"},
 		{"s", "open flat session list"},
 		{"Tab", "open grouped session list"},
@@ -882,9 +896,11 @@ func (m *model) renderMessage(idx int, msg *parser.Message) []item {
 		})
 	}
 
-	// Tool calls.
-	for ti, tc := range msg.ToolCalls {
-		items = append(items, m.renderToolCall(idx, ti, tc)...)
+	// Tool calls (only when visible).
+	if m.showTools {
+		for ti, tc := range msg.ToolCalls {
+			items = append(items, m.renderToolCall(idx, ti, tc)...)
+		}
 	}
 
 	return items
@@ -910,20 +926,10 @@ func (m *model) renderToolCall(msgIdx, toolIdx int, tc *parser.ToolCall) []item 
 		return items
 	}
 
-	// Expanded: show arguments.
-	if tc.Arguments != "" && tc.Arguments != "{}" {
-		pretty := prettyJSON(tc.Arguments)
-		for _, line := range strings.Split(pretty, "\n") {
-			items = append(items, item{
-				text:      styleTool.Render("     │ ") + line,
-				plain:     "     │ " + line,
-				msgIndex:  msgIdx,
-				toolIndex: toolIdx,
-			})
-		}
-	}
+	// Expanded: show arguments (diff format for Edit/MultiEdit, JSON otherwise).
+	items = append(items, m.renderToolArgs(msgIdx, toolIdx, tc)...)
 
-	// Expanded: show result.
+	// Expanded: show result (omit if empty).
 	if tc.Result != "" {
 		label := styleToolFold.Render("  result: ")
 		labelPlain := "  result: "
@@ -944,6 +950,97 @@ func (m *model) renderToolCall(msgIdx, toolIdx int, tc *parser.ToolCall) []item 
 		}
 	}
 
+	return items
+}
+
+// renderToolArgs renders the argument section for an expanded tool call.
+// For Edit/MultiEdit it shows a unified-diff-style view; otherwise pretty JSON.
+func (m *model) renderToolArgs(msgIdx, toolIdx int, tc *parser.ToolCall) []item {
+	if tc.Name == "Edit" || tc.Name == "MultiEdit" {
+		if items := m.renderEditDiff(msgIdx, toolIdx, tc); len(items) > 0 {
+			return items
+		}
+	}
+	if tc.Arguments == "" || tc.Arguments == "{}" {
+		return nil
+	}
+	pretty := prettyJSON(tc.Arguments)
+	var items []item
+	for _, line := range strings.Split(pretty, "\n") {
+		items = append(items, item{
+			text:      styleTool.Render("     │ ") + line,
+			plain:     "     │ " + line,
+			msgIndex:  msgIdx,
+			toolIndex: toolIdx,
+		})
+	}
+	return items
+}
+
+// renderEditDiff renders Edit/MultiEdit arguments as a unified-diff-style block.
+func (m *model) renderEditDiff(msgIdx, toolIdx int, tc *parser.ToolCall) []item {
+	pipe := styleDim.Render("     │ ")
+	pipePlain := "     │ "
+
+	addLine := func(items []item, rendered, plain string) []item {
+		return append(items, item{
+			text:      pipe + rendered,
+			plain:     pipePlain + plain,
+			msgIndex:  msgIdx,
+			toolIndex: toolIdx,
+		})
+	}
+
+	renderHunk := func(items []item, oldStr, newStr string) []item {
+		for _, line := range strings.Split(oldStr, "\n") {
+			items = addLine(items, styleRemoved.Render("-"+line), "-"+line)
+		}
+		for _, line := range strings.Split(newStr, "\n") {
+			items = addLine(items, styleAdded.Render("+"+line), "+"+line)
+		}
+		return items
+	}
+
+	var items []item
+
+	if tc.Name == "Edit" {
+		var args struct {
+			FilePath  string `json:"file_path"`
+			OldString string `json:"old_string"`
+			NewString string `json:"new_string"`
+		}
+		if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+			return nil
+		}
+		if args.FilePath != "" {
+			items = addLine(items, styleDim.Render("file: "+args.FilePath), "file: "+args.FilePath)
+		}
+		items = renderHunk(items, args.OldString, args.NewString)
+		return items
+	}
+
+	// MultiEdit
+	var args struct {
+		FilePath string `json:"file_path"`
+		Edits    []struct {
+			OldString string `json:"old_string"`
+			NewString string `json:"new_string"`
+		} `json:"edits"`
+	}
+	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+		return nil
+	}
+	if args.FilePath != "" {
+		items = addLine(items, styleDim.Render("file: "+args.FilePath), "file: "+args.FilePath)
+	}
+	for i, edit := range args.Edits {
+		if len(args.Edits) > 1 {
+			hunkHeader := styleDim.Render(fmt.Sprintf("@@ edit %d @@", i+1))
+			hunkPlain := fmt.Sprintf("@@ edit %d @@", i+1)
+			items = addLine(items, hunkHeader, hunkPlain)
+		}
+		items = renderHunk(items, edit.OldString, edit.NewString)
+	}
 	return items
 }
 
