@@ -22,29 +22,79 @@ func messageText(msg *parser.Message) string {
 	return sb.String()
 }
 
+// FilterOptions controls how FilterSession operates.
+type FilterOptions struct {
+	UseRegex bool
+	// Before is the number of context messages to show before each match (-B).
+	Before int
+	// After is the number of context messages to show after each match (-A).
+	After int
+}
+
 // FilterSession writes only messages that match pattern to w.
 // If useRegex is true, pattern is compiled as a regular expression.
 // Non-contiguous matching groups are separated by a "--" line.
-func FilterSession(w io.Writer, session *parser.Session, pattern string, useRegex bool) error {
-	match, err := buildMatcher(pattern, useRegex)
+// Before/After context lines are included when opts.Before/After > 0.
+func FilterSession(w io.Writer, session *parser.Session, pattern string, opts FilterOptions) error {
+	match, err := buildMatcher(pattern, opts.UseRegex)
 	if err != nil {
 		return err
 	}
 
-	prevMatchIdx := -2
-	for i, msg := range session.Messages {
-		if msg.Role == "" {
+	msgs := session.Messages
+
+	// Build a slice of "visible" indices (messages with a role).
+	visible := make([]int, 0, len(msgs))
+	for i, m := range msgs {
+		if m.Role != "" {
+			visible = append(visible, i)
+		}
+	}
+
+	// Mark which visible positions match.
+	isMatch := make([]bool, len(visible))
+	for vi, mi := range visible {
+		isMatch[vi] = match(messageText(msgs[mi]))
+	}
+
+	// Expand matches with before/after context into a set of visible indices to print.
+	// We track which visible positions are included and whether a separator is needed.
+	type printEntry struct {
+		visibleIdx int
+		sep        bool // print "--" before this entry
+	}
+	var entries []printEntry
+	lastIncluded := -1
+
+	for vi := range visible {
+		if !isMatch[vi] {
 			continue
 		}
-		if !match(messageText(msg)) {
-			continue
+		// Compute the context window around this match.
+		start := vi - opts.Before
+		if start < 0 {
+			start = 0
 		}
-		// Print separator when there is a gap between match groups.
-		if prevMatchIdx >= 0 && i > prevMatchIdx+1 {
+		end := vi + opts.After
+		if end >= len(visible) {
+			end = len(visible) - 1
+		}
+
+		for ci := start; ci <= end; ci++ {
+			if ci <= lastIncluded {
+				continue // already queued
+			}
+			needSep := lastIncluded >= 0 && ci > lastIncluded+1
+			entries = append(entries, printEntry{visibleIdx: ci, sep: needSep})
+			lastIncluded = ci
+		}
+	}
+
+	for _, e := range entries {
+		if e.sep {
 			fmt.Fprintln(w, "--")
 		}
-		printMessage(w, msg)
-		prevMatchIdx = i
+		printMessage(w, msgs[visible[e.visibleIdx]])
 	}
 	return nil
 }
