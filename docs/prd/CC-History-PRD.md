@@ -5,7 +5,7 @@
 | 字段 | 内容 |
 |------|------|
 | **项目名称** | CC History |
-| **文档版本** | 1.1.0 |
+| **文档版本** | 1.2.0 |
 | **创建日期** | 2026-03-29 |
 | **负责人** | CC History Engineer |
 | **文档状态** | Draft |
@@ -376,9 +376,209 @@ $ cc-history --tui
 
 ---
 
-## 7. 实施计划
+## 7. 使用示例
 
-### 7.1 里程碑
+本节展示两种模式的实际终端输出样例，作为开发阶段的 UX 参考基准。
+
+### 7.1 模式一：默认列表模式（Plain Text）
+
+#### 基本命令：列出所有会话
+
+```
+$ cc-history
+
+  #    DATE              TITLE (auto-extracted)              MSGS   DIR
+  ─────────────────────────────────────────────────────────────────────────
+  1    2026-03-29 10:30  Fix auth middleware bug              45    ~/project-a
+  2    2026-03-28 15:22  Add unit tests for user API          23    ~/project-a
+  3    2026-03-28 09:15  Refactor database layer              67    ~/project-b
+  4    2026-03-27 18:04  Setup CI/CD pipeline with GitHub     12    ~/project-b
+  5    2026-03-27 14:00  Write PRD for cc-history tool        88    ~/cc-history
+  ...
+  (showing 20 of 147 sessions, use --all to show all)
+```
+
+#### 查看某个会话的摘要
+
+```
+$ cc-history 3
+
+Session #3  ·  2026-03-28 09:15  ·  67 messages  ·  ~/project-b
+────────────────────────────────────────────────────────────────
+[user]       Refactor the database layer to use repository pattern
+[assistant]  I'll start by reading the existing database code...
+[tool]       Read: src/db/database.go
+[tool]       Read: src/db/queries.go
+[assistant]  Here's the refactored structure...
+[user]       Can you also add connection pooling?
+[assistant]  Sure, I'll add pgxpool configuration...
+[tool]       Edit: src/db/pool.go
+[tool]       Bash: go test ./src/db/...
+[assistant]  All tests pass. Here's a summary of the changes...
+```
+
+#### 搜索关键词
+
+```
+$ cc-history --search "auth"
+
+Found 3 sessions matching "auth":
+  #    DATE              TITLE                                MSGS   DIR
+  ────────────────────────────────────────────────────────────────────────
+  1    2026-03-29 10:30  Fix auth middleware bug              45    ~/project-a
+  7    2026-03-25 11:10  Implement JWT auth flow              93    ~/project-a
+  12   2026-03-20 16:45  Debug OAuth2 token refresh issue     31    ~/project-a
+```
+
+#### 按时间过滤
+
+```
+$ cc-history --since 2026-03-28 --until 2026-03-29
+
+  #    DATE              TITLE                                MSGS   DIR
+  ────────────────────────────────────────────────────────────────────────
+  1    2026-03-29 10:30  Fix auth middleware bug              45    ~/project-a
+  2    2026-03-28 15:22  Add unit tests for user API          23    ~/project-a
+  3    2026-03-28 09:15  Refactor database layer              67    ~/project-b
+```
+
+#### 导出单个会话为 Markdown
+
+```
+$ cc-history export 1 --format markdown --output session-auth-fix.md
+
+Exported session #1 to session-auth-fix.md (45 messages, 12.3 KB)
+```
+
+#### 重建提示词
+
+```
+$ cc-history prompt 1 --range 1-5
+
+Extracted prompt template (messages 1–5 of session #1):
+
+---
+[Context]
+Working directory: ~/project-a
+Session date: 2026-03-29
+
+[User]
+Fix auth middleware bug
+
+[Assistant Summary]
+Identified issue in middleware/auth.go line 42: token expiry not checked.
+
+[Reconstructed Prompt]
+Given the following auth middleware code, fix the token expiry check bug:
+<paste relevant code here>
+---
+
+Copied to clipboard.
+```
+
+---
+
+### 7.2 模式二：交互式 TUI 模式（`--tui` 或 `-i`）
+
+#### 启动 TUI
+
+```
+$ cc-history --tui
+```
+
+**会话列表主界面**
+
+```
+┌─ CC History ─────────────────────────────────── [?] Help  [q] Quit ─┐
+│                                                                       │
+│  Sessions (147)              [/ Search]                               │
+│  ──────────────────────────────────────────────────────────────────  │
+│  ▶  #1  2026-03-29 10:30  Fix auth middleware bug         45 msgs    │
+│     #2  2026-03-28 15:22  Add unit tests for user API     23 msgs    │
+│     #3  2026-03-28 09:15  Refactor database layer         67 msgs    │
+│     #4  2026-03-27 18:04  Setup CI/CD pipeline            12 msgs    │
+│     #5  2026-03-27 14:00  Write PRD for cc-history tool   88 msgs    │
+│     #6  2026-03-26 20:30  Debug memory leak in parser     34 msgs    │
+│     #7  2026-03-25 11:10  Implement JWT auth flow         93 msgs    │
+│     ...                                                               │
+│                                                                       │
+│  ────────────────────────────────────────────────────────────────── │
+│  [↑↓] Navigate  [Enter] Open  [/] Search  [e] Export  [q] Quit      │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**打开会话详情（按 Enter）**
+
+```
+┌─ CC History ─ Session #1: Fix auth middleware bug ── [Esc] Back ────┐
+│                                                                       │
+│  ◀ Back  │  2026-03-29 10:30  ·  45 messages  ·  ~/project-a        │
+│  ─────────────────────────────────────────────────────────────────  │
+│                                                                       │
+│  👤 User  [10:30:01]                                                 │
+│  ╔══════════════════════════════════════════════════════════════╗    │
+│  ║ The auth middleware is rejecting valid tokens. The error is  ║    │
+│  ║ "token expired" but the tokens are brand new. Please fix it. ║    │
+│  ╚══════════════════════════════════════════════════════════════╝    │
+│                                                                       │
+│  🤖 Claude  [10:30:05]                                               │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ I'll start by reading the auth middleware to find the issue. │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+│                                                                       │
+│  🔧 Read  middleware/auth.go  [10:30:06]  (12ms)         [▶ expand]  │
+│                                                                       │
+│  🤖 Claude  [10:30:09]                                               │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ Found the bug on line 42: the code checks `exp < now` but    │    │
+│  │ should check `exp <= now`. Here's the fix...                 │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+│                                                                       │
+│  ─────────────────────────────────────────────────────────────────  │
+│  [↑↓] Scroll  [e] Export  [p] Copy Prompt  [t] Tool Details  [Esc]  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**搜索模式（按 `/`）**
+
+```
+┌─ CC History ─────────────────────── Search ────────────────────────┐
+│                                                                      │
+│  Search: auth█                                                       │
+│  ─────────────────────────────────────────────────────────────────  │
+│  ▶ #1   2026-03-29 10:30  Fix auth middleware bug         45 msgs   │
+│    #7   2026-03-25 11:10  Implement JWT auth flow         93 msgs   │
+│    #12  2026-03-20 16:45  Debug OAuth2 token refresh      31 msgs   │
+│                                                                      │
+│  3 results                                                           │
+│  ─────────────────────────────────────────────────────────────────  │
+│  [↑↓] Navigate  [Enter] Open  [Esc] Cancel search                   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**展开工具调用详情（按 `t`）**
+
+```
+│  🔧 Read  middleware/auth.go  [10:30:06]  (12ms)         [▼ collapse]│
+│  ┌─ Tool Input ─────────────────────────────────────────────────┐    │
+│  │ {                                                             │    │
+│  │   "file_path": "/home/user/project-a/middleware/auth.go"     │    │
+│  │ }                                                             │    │
+│  └───────────────────────────────────────────────────────────── ┘    │
+│  ┌─ Tool Result (truncated) ────────────────────────────────────┐    │
+│  │ 1  package middleware                                         │    │
+│  │ 2                                                             │    │
+│  │ 3  func AuthMiddleware(next http.Handler) http.Handler {      │    │
+│  │ 4    return http.HandlerFunc(func(w http.ResponseWriter, ...  │    │
+│  │ ...  [press Space to see full output]                         │    │
+│  └───────────────────────────────────────────────────────────── ┘    │
+```
+
+---
+
+## 8. 实施计划
+
+### 8.1 里程碑
 
 | 里程碑 | 交付物 | 预计时间 |
 |--------|--------|---------|
@@ -389,7 +589,7 @@ $ cc-history --tui
 | **M5: 高级功能** | 提示词重建、数据导出 | Day 9-10 |
 | **M6: 测试和优化** | 单元测试、性能优化、文档完善 | Day 11-12 |
 
-### 7.2 任务分解
+### 8.2 任务分解
 
 #### Sprint 1: 基础设施 (Day 1-3)
 - [ ] 创建 Go 项目结构（go mod init）
@@ -416,9 +616,9 @@ $ cc-history --tui
 
 ---
 
-## 8. 验收标准
+## 9. 验收标准
 
-### 8.1 功能验收
+### 9.1 功能验收
 
 - [ ] 能够加载并显示 Claude Code 会话列表
 - [ ] 能够查看单个会话的完整历史
@@ -426,13 +626,13 @@ $ cc-history --tui
 - [ ] 能够导出会话为 Markdown/JSON
 - [ ] 能够从历史记录重建提示词
 
-### 8.2 性能验收
+### 9.2 性能验收
 
 - [ ] 1000 个会话加载时间 < 2s
 - [ ] 搜索响应时间 < 500ms
 - [ ] UI 操作响应时间 < 100ms
 
-### 8.3 质量验收
+### 9.3 质量验收
 
 - [ ] 代码测试覆盖率 > 80%
 - [ ] 所有核心功能有单元测试
@@ -441,9 +641,9 @@ $ cc-history --tui
 
 ---
 
-## 9. 风险与依赖
+## 10. 风险与依赖
 
-### 9.1 风险
+### 10.1 风险
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
@@ -452,7 +652,7 @@ $ cc-history --tui
 | TUI 兼容性问题 | 低 | 默认简洁模式不依赖 TUI，TUI 为可选模式 |
 | Go 编译环境 | 低 | 提供预编译二进制，go install 一键安装 |
 
-### 9.2 依赖
+### 10.2 依赖
 
 | 依赖项 | 版本要求 | 用途 |
 |--------|---------|------|
@@ -465,9 +665,9 @@ $ cc-history --tui
 
 ---
 
-## 10. 附录
+## 11. 附录
 
-### 10.1 术语表
+### 11.1 术语表
 
 | 术语 | 定义 |
 |------|------|
@@ -477,19 +677,20 @@ $ cc-history --tui
 | **PRD** | Product Requirements Document，产品需求文档 |
 | **BMAD** | 本项目采用的需求文档方法论 |
 
-### 10.2 参考文档
+### 11.2 参考文档
 
 - [Claude Code 官方文档](https://claude.ai/claude-code)
 - [Bubbletea 文档](https://github.com/charmbracelet/bubbletea)
 - [Cobra 文档](https://cobra.dev/)
 - [Lipgloss 文档](https://github.com/charmbracelet/lipgloss)
 
-### 10.3 变更记录
+### 11.3 变更记录
 
 | 版本 | 日期 | 变更内容 | 作者 |
 |------|------|---------|------|
 | 1.0.0 | 2026-03-29 | 初始版本 | CC History Engineer |
 | 1.1.0 | 2026-03-29 | 根据 LF 审核意见修订：技术栈改为 Go、去除数据库层、增加双模式输出 | CC History Engineer |
+| 1.2.0 | 2026-03-29 | 新增完整使用示例（默认模式 & TUI 模式样例输出） | CC History Engineer |
 
 ---
 
