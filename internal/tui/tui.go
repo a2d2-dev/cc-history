@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/a2d2-dev/cc-history/internal/config"
+	"github.com/a2d2-dev/cc-history/internal/loader"
 	"github.com/a2d2-dev/cc-history/internal/parser"
 )
 
@@ -35,6 +36,8 @@ var (
 	stylePickBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
 	styleRemoved   = lipgloss.NewStyle().Foreground(lipgloss.Color("1")) // red  (diff -)
 	styleAdded     = lipgloss.NewStyle().Foreground(lipgloss.Color("2")) // green (diff +)
+	styleArchive   = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)                       // red bold
+	styleOK        = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))                                  // green
 )
 
 // --------------------------------------------------------------------------
@@ -70,6 +73,17 @@ type displayRow struct {
 	cwd        string // abbreviated group path (both types)
 	sessionIdx int    // index into model.sessions; -1 for group rows
 	count      int    // for group rows: number of sessions in group
+}
+
+// --------------------------------------------------------------------------
+// Archive undo record
+// --------------------------------------------------------------------------
+
+// archiveAction records a single archive or restore operation for undo.
+type archiveAction struct {
+	fromPath    string // original path
+	toPath      string // destination path
+	wasArchived bool   // true = archive action, false = restore action
 }
 
 // --------------------------------------------------------------------------
@@ -110,6 +124,12 @@ type model struct {
 	expandedGroups map[string]bool // cwd -> expanded; persists for the session
 	groupRows      []displayRow    // computed rows for grouped view (rebuilt on toggle)
 	groupPickCursor int            // cursor position in groupRows
+
+	// archive / restore
+	sessionsRoot string        // live sessions root (e.g. ~/.claude/projects)
+	showArchived bool          // true = currently viewing archived sessions
+	lastAction   *archiveAction // last archive/restore action (for undo)
+	statusMsg    string         // transient one-line status displayed in status bar
 }
 
 // session returns the currently active session.
@@ -120,20 +140,29 @@ func (m model) session() *parser.Session {
 	return m.sessions[m.sessionIdx]
 }
 
+// currentRoot returns the root directory being viewed (live or archive).
+func (m model) currentRoot() string {
+	if m.showArchived {
+		return loader.ArchiveRoot(m.sessionsRoot)
+	}
+	return m.sessionsRoot
+}
+
 // --------------------------------------------------------------------------
 // Launch
 // --------------------------------------------------------------------------
 
 // RunTUI starts the TUI with a list of sessions, opening the one at currentIdx.
+// sessionsRoot is the live sessions directory (used for archive operations).
 // It blocks until the user quits.
-func RunTUI(sessions []*parser.Session, currentIdx int) error {
+func RunTUI(sessions []*parser.Session, currentIdx int, sessionsRoot string) error {
 	if len(sessions) == 0 {
 		return fmt.Errorf("no sessions to display")
 	}
 	if currentIdx < 0 || currentIdx >= len(sessions) {
 		currentIdx = 0
 	}
-	m := newModelMulti(sessions, currentIdx)
+	m := newModelMulti(sessions, currentIdx, sessionsRoot)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
@@ -142,10 +171,10 @@ func RunTUI(sessions []*parser.Session, currentIdx int) error {
 // RunSession starts the TUI for a single session and blocks until the user quits.
 // Kept for backward compatibility.
 func RunSession(session *parser.Session) error {
-	return RunTUI([]*parser.Session{session}, 0)
+	return RunTUI([]*parser.Session{session}, 0, "")
 }
 
-func newModelMulti(sessions []*parser.Session, idx int) model {
+func newModelMulti(sessions []*parser.Session, idx int, sessionsRoot string) model {
 	cfg := config.Load()
 	m := model{
 		sessions:       sessions,
@@ -155,6 +184,7 @@ func newModelMulti(sessions []*parser.Session, idx int) model {
 		showTools:      cfg.ShowTools,
 		height:         24,
 		width:          80,
+		sessionsRoot:   sessionsRoot,
 	}
 	m.rebuildItems()
 	return m
@@ -162,7 +192,7 @@ func newModelMulti(sessions []*parser.Session, idx int) model {
 
 // newModel creates a model from a single session (used by tests).
 func newModel(session *parser.Session) model {
-	return newModelMulti([]*parser.Session{session}, 0)
+	return newModelMulti([]*parser.Session{session}, 0, "")
 }
 
 // --------------------------------------------------------------------------
@@ -200,6 +230,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Clear transient status on any key.
+	m.statusMsg = ""
+
 	switch msg.String() {
 	case "q", "Q", "ctrl+c":
 		return m, tea.Quit
@@ -286,8 +319,159 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "i":
 		m.mode = modeInfo
+
+	case "a":
+		m = m.doArchive()
+
+	case "A":
+		m = m.doToggleArchiveView()
+
+	case "u":
+		m = m.doUndo()
 	}
 	return m, nil
+}
+
+// doArchive archives (or restores) the currently selected session.
+func (m model) doArchive() model {
+	if m.sessionsRoot == "" {
+		m.statusMsg = "archive unavailable: no session root"
+		return m
+	}
+	sess := m.session()
+	if sess == nil {
+		return m
+	}
+
+	var dstPath string
+	var err error
+	var action archiveAction
+
+	if m.showArchived {
+		// Currently in archive view → restore to live.
+		dstPath, err = loader.RestoreSession(m.sessionsRoot, sess.FilePath)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("restore failed: %v", err)
+			return m
+		}
+		action = archiveAction{
+			fromPath:    sess.FilePath,
+			toPath:      dstPath,
+			wasArchived: false,
+		}
+		m.statusMsg = fmt.Sprintf("restored: %s", shortPath(dstPath))
+	} else {
+		// Currently in live view → archive.
+		dstPath, err = loader.ArchiveSession(m.sessionsRoot, sess.FilePath)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("archive failed: %v", err)
+			return m
+		}
+		action = archiveAction{
+			fromPath:    sess.FilePath,
+			toPath:      dstPath,
+			wasArchived: true,
+		}
+		m.statusMsg = fmt.Sprintf("archived: %s", shortPath(dstPath))
+	}
+
+	m.lastAction = &action
+	// Remove the session from the current list and update the index.
+	m.sessions = append(m.sessions[:m.sessionIdx], m.sessions[m.sessionIdx+1:]...)
+	if m.sessionIdx >= len(m.sessions) && m.sessionIdx > 0 {
+		m.sessionIdx--
+	}
+	m.expanded = make(map[int]bool)
+	m.cursor = 0
+	m.matches = nil
+	m.matchCursor = 0
+	m.rebuildItems()
+	return m
+}
+
+// doToggleArchiveView switches between live and archived session views.
+func (m model) doToggleArchiveView() model {
+	if m.sessionsRoot == "" {
+		m.statusMsg = "archive unavailable: no session root"
+		return m
+	}
+	m.showArchived = !m.showArchived
+	newRoot := m.currentRoot()
+	newSessions, err := loader.LoadAllSessions(newRoot)
+	if err != nil || len(newSessions) == 0 {
+		// Toggle back on empty archive; show message.
+		m.showArchived = !m.showArchived
+		if m.showArchived {
+			m.statusMsg = "no archived sessions found"
+		} else {
+			m.statusMsg = fmt.Sprintf("load error: %v", err)
+		}
+		return m
+	}
+	m.sessions = newSessions
+	m.sessionIdx = len(newSessions) - 1 // most recent
+	m.expanded = make(map[int]bool)
+	m.cursor = 0
+	m.searchQuery = ""
+	m.matches = nil
+	m.matchCursor = 0
+	m.rebuildItems()
+	if m.showArchived {
+		m.statusMsg = fmt.Sprintf("archive view: %d sessions", len(newSessions))
+	} else {
+		m.statusMsg = fmt.Sprintf("live view: %d sessions", len(newSessions))
+	}
+	return m
+}
+
+// doUndo reverses the last archive or restore operation.
+func (m model) doUndo() model {
+	if m.lastAction == nil {
+		m.statusMsg = "nothing to undo"
+		return m
+	}
+	act := m.lastAction
+
+	// Determine which direction to move: from toPath back to fromPath.
+	srcRoot := m.currentRoot()
+	var err error
+	var restoredPath string
+	if act.wasArchived {
+		// Last action was archive (live→archive). Undo = restore (archive→live).
+		restoredPath, err = loader.RestoreSession(m.sessionsRoot, act.toPath)
+	} else {
+		// Last action was restore (archive→live). Undo = re-archive (live→archive).
+		restoredPath, err = loader.ArchiveSession(m.sessionsRoot, act.toPath)
+	}
+	if err != nil {
+		m.statusMsg = fmt.Sprintf("undo failed: %v", err)
+		return m
+	}
+	_ = srcRoot
+	m.lastAction = nil
+
+	// Reload the current view.
+	newSessions, err := loader.LoadAllSessions(m.currentRoot())
+	if err != nil {
+		m.statusMsg = fmt.Sprintf("undo ok, reload error: %v", err)
+		return m
+	}
+	m.sessions = newSessions
+	// Try to restore the cursor to the affected session.
+	m.sessionIdx = len(newSessions) - 1
+	for i, s := range newSessions {
+		if s.FilePath == restoredPath {
+			m.sessionIdx = i
+			break
+		}
+	}
+	m.expanded = make(map[int]bool)
+	m.cursor = 0
+	m.matches = nil
+	m.matchCursor = 0
+	m.rebuildItems()
+	m.statusMsg = fmt.Sprintf("undone: %s", shortPath(restoredPath))
+	return m
 }
 
 func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -535,12 +719,14 @@ func (m model) mainView() string {
 }
 
 func (m model) statusBar() string {
-	pct := 0
-	if len(m.items) > 0 {
-		pct = (m.cursor + m.viewHeight()) * 100 / len(m.items)
-		if pct > 100 {
-			pct = 100
+	// Transient status message takes priority.
+	if m.statusMsg != "" {
+		pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
+		gap := m.width - lipgloss.Width(m.statusMsg) - lipgloss.Width(pos)
+		if gap < 0 {
+			gap = 0
 		}
+		return m.statusMsg + strings.Repeat(" ", gap) + pos
 	}
 
 	var hint string
@@ -553,6 +739,10 @@ func (m model) statusBar() string {
 	} else if m.searchQuery != "" {
 		hint = styleHelp.Render(fmt.Sprintf("/%s  [%d/%d]  n next · N prev · / new search", m.searchQuery, m.matchCursor+1, len(m.matches)))
 	} else {
+		viewLabel := ""
+		if m.showArchived {
+			viewLabel = styleArchive.Render("[ARCHIVE]") + " "
+		}
 		sessionInfo := ""
 		if len(m.sessions) > 1 {
 			sessionInfo = fmt.Sprintf(" s list · Tab grouped(%d)", len(m.sessions))
@@ -561,15 +751,26 @@ func (m model) statusBar() string {
 		if !m.showTools {
 			toolsHint = "t show tools"
 		}
-		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
+		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
-	pos := styleDim.Render(fmt.Sprintf(" %d%%", pct))
+	pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
 	gap := m.width - lipgloss.Width(hint) - lipgloss.Width(pos)
 	if gap < 0 {
 		gap = 0
 	}
 	return hint + strings.Repeat(" ", gap) + pos
+}
+
+func (m model) scrollPct() int {
+	if len(m.items) == 0 {
+		return 100
+	}
+	pct := (m.cursor + m.viewHeight()) * 100 / len(m.items)
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
 }
 
 func (m model) pickerView() string {
@@ -662,6 +863,9 @@ func (m model) helpModalView() string {
 		{"t", "hide / show all tool calls"},
 		{"T", "expand / collapse tool details for focused message"},
 		{"i", "show session info"},
+		{"a", "archive session (restore in archive view)"},
+		{"A", "toggle live / archive view"},
+		{"u", "undo last archive / restore"},
 		{"s", "open flat session list"},
 		{"Tab", "open grouped session list"},
 		{"/", "enter search mode"},
@@ -1107,6 +1311,15 @@ func prettyJSON(raw string) string {
 	return string(b)
 }
 
+// shortPath returns the last two path components for display.
+func shortPath(p string) string {
+	parts := strings.Split(p, "/")
+	if len(parts) <= 2 {
+		return p
+	}
+	return "…/" + strings.Join(parts[len(parts)-2:], "/")
+}
+
 // wordWrap wraps s at maxWidth runes.
 func wordWrap(s string, maxWidth int) string {
 	if maxWidth <= 0 {
@@ -1391,3 +1604,6 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// Ensure styleOK and styleArchive are used (they appear in the status bar logic).
+var _ = styleOK

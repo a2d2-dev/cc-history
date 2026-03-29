@@ -169,7 +169,7 @@ func TestSessionSwitcher(t *testing.T) {
 	s1.ID = "s1"
 	s2.ID = "s2"
 
-	m := newModelMulti([]*parser.Session{s1, s2}, 0)
+	m := newModelMulti([]*parser.Session{s1, s2}, 0, "")
 	if m.sessionIdx != 0 {
 		t.Errorf("expected sessionIdx 0, got %d", m.sessionIdx)
 	}
@@ -196,7 +196,7 @@ func TestPickerMode(t *testing.T) {
 	s1 := makeSession([]*parser.Message{makeMsg("user", "alpha")})
 	s2 := makeSession([]*parser.Message{makeMsg("user", "beta")})
 
-	m := newModelMulti([]*parser.Session{s1, s2}, 0)
+	m := newModelMulti([]*parser.Session{s1, s2}, 0, "")
 	m.mode = modePicker
 	m.pickCursor = 1
 
@@ -258,8 +258,9 @@ func TestHelpModalContextAware(t *testing.T) {
 
 	// Multiple sessions: "Session list" section should appear.
 	s2 := makeSession([]*parser.Message{makeMsg("user", "bye")})
-	m2 := newModelMulti([]*parser.Session{s, s2}, 0)
+	m2 := newModelMulti([]*parser.Session{s, s2}, 0, "")
 	m2.mode = modeHelp
+	m2.height = 40
 	view2 := m2.View()
 	if !strings.Contains(view2, "Session list") {
 		t.Error("multi-session help should show 'Session list' section")
