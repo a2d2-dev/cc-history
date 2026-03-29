@@ -47,7 +47,6 @@ func runExport(args []string, globalPath string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	sessionFlag := fs.String("session", "", "session ID to export (default: current session)")
 	formatFlag := fs.String("format", "markdown", "output format: markdown or json")
-	outputFlag := fs.String("output", "", "output file path (default: stdout)")
 	fs.Parse(args) //nolint:errcheck // ExitOnError handles errors
 
 	root := resolveRoot(globalPath)
@@ -79,26 +78,14 @@ func runExport(args []string, globalPath string) {
 		os.Exit(1)
 	}
 
-	// Determine output writer.
-	out := os.Stdout
-	if *outputFlag != "" {
-		f, err := os.Create(*outputFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: cannot create output file: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		out = f
-	}
-
 	switch *formatFlag {
 	case "markdown", "md":
-		if err := ccexport.ToMarkdown(out, session); err != nil {
+		if err := ccexport.ToMarkdown(os.Stdout, session); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 	case "json":
-		if err := ccexport.ToJSON(out, session); err != nil {
+		if err := ccexport.ToJSON(os.Stdout, session); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
