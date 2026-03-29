@@ -94,6 +94,20 @@ type archiveAction struct {
 }
 
 // --------------------------------------------------------------------------
+// Lazy session slot
+// --------------------------------------------------------------------------
+
+// sessionSlot holds lazily-loaded session data.
+// On startup only the metadata is populated; the first-message preview and
+// full session content are loaded on demand.
+type sessionSlot struct {
+	meta          *parser.SessionMeta
+	preview       string          // first user message text; "" until loaded
+	previewLoaded bool            // true after load attempt (even if preview is empty)
+	full          *parser.Session // nil until session is selected for viewing
+}
+
+// --------------------------------------------------------------------------
 // Model
 // --------------------------------------------------------------------------
 
@@ -107,7 +121,7 @@ type item struct {
 
 // model is the bubbletea model for the TUI.
 type model struct {
-	sessions   []*parser.Session
+	slots      []*sessionSlot
 	sessionIdx int
 	items      []item
 	expanded   map[int]bool // msgIndex -> expanded (tool call details)
@@ -169,12 +183,27 @@ type searchResultMsg struct {
 // spinnerTickMsg advances the spinner animation frame.
 type spinnerTickMsg struct{ frame int }
 
-// session returns the currently active session.
-func (m model) session() *parser.Session {
-	if len(m.sessions) == 0 {
+// previewLoadedMsg carries an asynchronously loaded first-message preview.
+type previewLoadedMsg struct {
+	slotIdx int
+	preview string
+}
+
+// currentSlot returns the currently active session slot, or nil if none.
+func (m model) currentSlot() *sessionSlot {
+	if len(m.slots) == 0 || m.sessionIdx < 0 || m.sessionIdx >= len(m.slots) {
 		return nil
 	}
-	return m.sessions[m.sessionIdx]
+	return m.slots[m.sessionIdx]
+}
+
+// session returns the full session for the active slot, or nil if not loaded.
+func (m model) session() *parser.Session {
+	s := m.currentSlot()
+	if s == nil {
+		return nil
+	}
+	return s.full
 }
 
 // currentRoot returns the root directory being viewed (live or archive).
@@ -189,32 +218,80 @@ func (m model) currentRoot() string {
 // Launch
 // --------------------------------------------------------------------------
 
-// RunTUI starts the TUI with a list of sessions, opening the one at currentIdx.
+// RunTUI starts the TUI with session metadata, loading full content lazily.
+// currentIdx is the index of the session to open first.
 // sessionsRoot is the live sessions directory (used for archive operations).
 // It blocks until the user quits.
-func RunTUI(sessions []*parser.Session, currentIdx int, sessionsRoot string) error {
-	if len(sessions) == 0 {
+func RunTUI(metas []*parser.SessionMeta, currentIdx int, sessionsRoot string) error {
+	if len(metas) == 0 {
 		return fmt.Errorf("no sessions to display")
 	}
-	if currentIdx < 0 || currentIdx >= len(sessions) {
+	if currentIdx < 0 || currentIdx >= len(metas) {
 		currentIdx = 0
 	}
-	m := newModelMulti(sessions, currentIdx, sessionsRoot)
+	slots := make([]*sessionSlot, len(metas))
+	for i, meta := range metas {
+		slots[i] = &sessionSlot{meta: meta}
+	}
+	m := newModelFromSlots(slots, currentIdx, sessionsRoot)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
 
 // RunSession starts the TUI for a single session and blocks until the user quits.
-// Kept for backward compatibility.
 func RunSession(session *parser.Session) error {
-	return RunTUI([]*parser.Session{session}, 0, "")
+	slot := slotFromSession(session)
+	m := newModelFromSlots([]*sessionSlot{slot}, 0, "")
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
 }
 
-func newModelMulti(sessions []*parser.Session, idx int, sessionsRoot string) model {
+// slotFromSession wraps a fully-loaded session in a sessionSlot, extracting
+// metadata from message content so no extra file reads are needed.
+func slotFromSession(s *parser.Session) *sessionSlot {
+	meta := &parser.SessionMeta{
+		ID:       s.ID,
+		FilePath: s.FilePath,
+	}
+	for _, msg := range s.Messages {
+		if !msg.Timestamp.IsZero() {
+			if meta.StartTime.IsZero() {
+				meta.StartTime = msg.Timestamp
+			}
+			meta.EndTime = msg.Timestamp
+		}
+		if meta.CWD == "" && msg.CWD != "" {
+			meta.CWD = msg.CWD
+		}
+	}
+	preview := ""
+	for _, msg := range s.Messages {
+		if msg.Role == "user" && msg.Text != "" {
+			p := strings.TrimSpace(msg.Text)
+			runes := []rune(p)
+			if len(runes) > 50 {
+				preview = string(runes[:50]) + "…"
+			} else {
+				preview = p
+			}
+			break
+		}
+	}
+	return &sessionSlot{
+		meta:          meta,
+		preview:       preview,
+		previewLoaded: true,
+		full:          s,
+	}
+}
+
+// newModelFromSlots creates a model from a slice of sessionSlots (internal).
+func newModelFromSlots(slots []*sessionSlot, idx int, sessionsRoot string) model {
 	cfg := config.Load()
 	m := model{
-		sessions:       sessions,
+		slots:          slots,
 		sessionIdx:     idx,
 		expanded:       make(map[int]bool),
 		expandedGroups: make(map[string]bool),
@@ -226,6 +303,15 @@ func newModelMulti(sessions []*parser.Session, idx int, sessionsRoot string) mod
 	}
 	m.rebuildItems()
 	return m
+}
+
+// newModelMulti creates a model from fully-loaded sessions (used by tests).
+func newModelMulti(sessions []*parser.Session, idx int, sessionsRoot string) model {
+	slots := make([]*sessionSlot, len(sessions))
+	for i, s := range sessions {
+		slots[i] = slotFromSession(s)
+	}
+	return newModelFromSlots(slots, idx, sessionsRoot)
 }
 
 // newModel creates a model from a single session (used by tests).
@@ -279,6 +365,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.spinnerFrame = msg.frame
 		return m, spinnerTickCmd(m.spinnerFrame)
+
+	case previewLoadedMsg:
+		if msg.slotIdx >= 0 && msg.slotIdx < len(m.slots) {
+			m.slots[msg.slotIdx].preview = msg.preview
+			m.slots[msg.slotIdx].previewLoaded = true
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		switch m.mode {
@@ -360,17 +453,19 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "s":
-		if len(m.sessions) > 1 {
+		if len(m.slots) > 1 {
 			m.mode = modePicker
 			m.groupedPicker = false
 			m.pickCursor = m.sessionIdx
+			return m, m.launchPreviewLoads()
 		}
 
 	case "tab":
-		if len(m.sessions) > 1 {
+		if len(m.slots) > 1 {
 			m.mode = modePicker
 			m.groupedPicker = true
 			m.buildGroupRows()
+			return m, m.launchPreviewLoads()
 		}
 
 	case "/":
@@ -416,9 +511,9 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "p":
-		if sess := m.session(); sess != nil {
-			m.repathSessionID = sess.ID
-			m.repathInput = sessionCWD(sess)
+		if slot := m.currentSlot(); slot != nil {
+			m.repathSessionID = slot.meta.ID
+			m.repathInput = slot.meta.CWD
 			m.mode = modeRepath
 		}
 	}
@@ -431,10 +526,11 @@ func (m model) doArchive() model {
 		m.statusMsg = "archive unavailable: no session root"
 		return m
 	}
-	sess := m.session()
-	if sess == nil {
+	slot := m.currentSlot()
+	if slot == nil {
 		return m
 	}
+	filePath := slot.meta.FilePath
 
 	var dstPath string
 	var err error
@@ -442,26 +538,26 @@ func (m model) doArchive() model {
 
 	if m.showArchived {
 		// Currently in archive view → restore to live.
-		dstPath, err = loader.RestoreSession(m.sessionsRoot, sess.FilePath)
+		dstPath, err = loader.RestoreSession(m.sessionsRoot, filePath)
 		if err != nil {
 			m.statusMsg = fmt.Sprintf("restore failed: %v", err)
 			return m
 		}
 		action = archiveAction{
-			fromPath:    sess.FilePath,
+			fromPath:    filePath,
 			toPath:      dstPath,
 			wasArchived: false,
 		}
 		m.statusMsg = fmt.Sprintf("restored: %s", shortPath(dstPath))
 	} else {
 		// Currently in live view → archive.
-		dstPath, err = loader.ArchiveSession(m.sessionsRoot, sess.FilePath)
+		dstPath, err = loader.ArchiveSession(m.sessionsRoot, filePath)
 		if err != nil {
 			m.statusMsg = fmt.Sprintf("archive failed: %v", err)
 			return m
 		}
 		action = archiveAction{
-			fromPath:    sess.FilePath,
+			fromPath:    filePath,
 			toPath:      dstPath,
 			wasArchived: true,
 		}
@@ -469,9 +565,9 @@ func (m model) doArchive() model {
 	}
 
 	m.lastAction = &action
-	// Remove the session from the current list and update the index.
-	m.sessions = append(m.sessions[:m.sessionIdx], m.sessions[m.sessionIdx+1:]...)
-	if m.sessionIdx >= len(m.sessions) && m.sessionIdx > 0 {
+	// Remove the slot from the current list and update the index.
+	m.slots = append(m.slots[:m.sessionIdx], m.slots[m.sessionIdx+1:]...)
+	if m.sessionIdx >= len(m.slots) && m.sessionIdx > 0 {
 		m.sessionIdx--
 	}
 	m.expanded = make(map[int]bool)
@@ -490,8 +586,8 @@ func (m model) doToggleArchiveView() model {
 	}
 	m.showArchived = !m.showArchived
 	newRoot := m.currentRoot()
-	newSessions, err := loader.LoadAllSessions(newRoot)
-	if err != nil || len(newSessions) == 0 {
+	newMetas, err := loader.LoadAllSessionsMeta(newRoot, "")
+	if err != nil || len(newMetas) == 0 {
 		// Toggle back on empty archive; show message.
 		m.showArchived = !m.showArchived
 		if m.showArchived {
@@ -501,8 +597,12 @@ func (m model) doToggleArchiveView() model {
 		}
 		return m
 	}
-	m.sessions = newSessions
-	m.sessionIdx = len(newSessions) - 1 // most recent
+	newSlots := make([]*sessionSlot, len(newMetas))
+	for i, meta := range newMetas {
+		newSlots[i] = &sessionSlot{meta: meta}
+	}
+	m.slots = newSlots
+	m.sessionIdx = len(newSlots) - 1 // most recent
 	m.expanded = make(map[int]bool)
 	m.cursor = 0
 	m.searchQuery = ""
@@ -510,9 +610,9 @@ func (m model) doToggleArchiveView() model {
 	m.matchCursor = 0
 	m.rebuildItems()
 	if m.showArchived {
-		m.statusMsg = fmt.Sprintf("archive view: %d sessions", len(newSessions))
+		m.statusMsg = fmt.Sprintf("archive view: %d sessions", len(newSlots))
 	} else {
-		m.statusMsg = fmt.Sprintf("live view: %d sessions", len(newSessions))
+		m.statusMsg = fmt.Sprintf("live view: %d sessions", len(newSlots))
 	}
 	return m
 }
@@ -544,16 +644,20 @@ func (m model) doUndo() model {
 	m.lastAction = nil
 
 	// Reload the current view.
-	newSessions, err := loader.LoadAllSessions(m.currentRoot())
+	newMetas, err := loader.LoadAllSessionsMeta(m.currentRoot(), "")
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("undo ok, reload error: %v", err)
 		return m
 	}
-	m.sessions = newSessions
+	newSlots := make([]*sessionSlot, len(newMetas))
+	for i, meta := range newMetas {
+		newSlots[i] = &sessionSlot{meta: meta}
+	}
+	m.slots = newSlots
 	// Try to restore the cursor to the affected session.
-	m.sessionIdx = len(newSessions) - 1
-	for i, s := range newSessions {
-		if s.FilePath == restoredPath {
+	m.sessionIdx = len(newSlots) - 1
+	for i, slot := range newSlots {
+		if slot.meta.FilePath == restoredPath {
 			m.sessionIdx = i
 			break
 		}
@@ -653,23 +757,28 @@ func (m model) doDuplicate() model {
 		m.mode = m.confirmReturnMode
 		return m
 	}
-	sess := m.session()
-	if sess == nil || sess.ID != m.duplicatingSessionID {
-		// Fall back to finding the target session.
-		for _, s := range m.sessions {
-			if s.ID == m.duplicatingSessionID {
-				sess = s
+	var filePath string
+	var origID string
+	slot := m.currentSlot()
+	if slot != nil && slot.meta.ID == m.duplicatingSessionID {
+		filePath = slot.meta.FilePath
+		origID = slot.meta.ID
+	} else {
+		for _, s := range m.slots {
+			if s.meta.ID == m.duplicatingSessionID {
+				filePath = s.meta.FilePath
+				origID = s.meta.ID
 				break
 			}
 		}
 	}
-	if sess == nil {
+	if filePath == "" {
 		m.statusMsg = "duplicate failed: session not found"
 		m.mode = m.confirmReturnMode
 		return m
 	}
 
-	_, newID, err := loader.DuplicateSession(sess.FilePath)
+	_, newID, err := loader.DuplicateSession(filePath)
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("duplicate failed: %v", err)
 		m.mode = m.confirmReturnMode
@@ -677,16 +786,20 @@ func (m model) doDuplicate() model {
 	}
 
 	// Reload sessions from disk.
-	newSessions, err := loader.LoadAllSessions(m.currentRoot())
+	newMetas, err := loader.LoadAllSessionsMeta(m.currentRoot(), "")
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("duplicate ok (%s) but reload failed: %v", newID[:8], err)
 		m.mode = m.confirmReturnMode
 		return m
 	}
-	m.sessions = newSessions
+	newSlots := make([]*sessionSlot, len(newMetas))
+	for i, meta := range newMetas {
+		newSlots[i] = &sessionSlot{meta: meta}
+	}
+	m.slots = newSlots
 	// Keep current session selected (find by original ID).
-	for i, s := range m.sessions {
-		if s.ID == sess.ID {
+	for i, s := range m.slots {
+		if s.meta.ID == origID {
 			m.sessionIdx = i
 			break
 		}
@@ -720,16 +833,18 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.pickCursor > 0 {
 			m.pickCursor--
+			return m, m.launchPreviewLoads()
 		}
 
 	case "down", "j":
-		if m.pickCursor < len(m.sessions)-1 {
+		if m.pickCursor < len(m.slots)-1 {
 			m.pickCursor++
+			return m, m.launchPreviewLoads()
 		}
 
 	case "n":
-		if m.pickCursor < len(m.sessions) {
-			m = m.startRename(m.sessions[m.pickCursor].ID, modePicker)
+		if m.pickCursor < len(m.slots) {
+			m = m.startRename(m.slots[m.pickCursor].meta.ID, modePicker)
 		}
 
 	case "enter":
@@ -745,8 +860,8 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 
 	case "d":
-		if m.pickCursor < len(m.sessions) {
-			m = m.startConfirmDuplicate(m.sessions[m.pickCursor].ID, modePicker)
+		if m.pickCursor < len(m.slots) {
+			m = m.startConfirmDuplicate(m.slots[m.pickCursor].meta.ID, modePicker)
 		}
 	}
 	return m, nil
@@ -763,22 +878,25 @@ func (m model) updateGroupedPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab":
 		m.groupedPicker = false
 		m.pickCursor = m.sessionIdx
+		return m, m.launchPreviewLoads()
 
 	case "up", "k":
 		if m.groupPickCursor > 0 {
 			m.groupPickCursor--
+			return m, m.launchPreviewLoads()
 		}
 
 	case "down", "j":
 		if m.groupPickCursor < len(m.groupRows)-1 {
 			m.groupPickCursor++
+			return m, m.launchPreviewLoads()
 		}
 
 	case "n":
 		if len(m.groupRows) > 0 {
 			row := m.groupRows[m.groupPickCursor]
-			if row.kind == rowKindSession && row.sessionIdx < len(m.sessions) {
-				m = m.startRename(m.sessions[row.sessionIdx].ID, modePicker)
+			if row.kind == rowKindSession && row.sessionIdx < len(m.slots) {
+				m = m.startRename(m.slots[row.sessionIdx].meta.ID, modePicker)
 				m.groupedPicker = true
 			}
 		}
@@ -817,8 +935,8 @@ func (m model) updateGroupedPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		if len(m.groupRows) > 0 {
 			row := m.groupRows[m.groupPickCursor]
-			if row.kind == rowKindSession && row.sessionIdx < len(m.sessions) {
-				m = m.startConfirmDuplicate(m.sessions[row.sessionIdx].ID, modePicker)
+			if row.kind == rowKindSession && row.sessionIdx < len(m.slots) {
+				m = m.startConfirmDuplicate(m.slots[row.sessionIdx].meta.ID, modePicker)
 			}
 		}
 	}
@@ -949,22 +1067,22 @@ func (m model) doRepath() model {
 		return m
 	}
 
-	var sess *parser.Session
-	for _, s := range m.sessions {
-		if s.ID == m.repathSessionID {
-			sess = s
+	var slot *sessionSlot
+	for _, s := range m.slots {
+		if s.meta.ID == m.repathSessionID {
+			slot = s
 			break
 		}
 	}
-	if sess == nil {
+	if slot == nil {
 		m.statusMsg = "repath failed: session not found"
 		m.repathSessionID = ""
 		m.mode = modeNormal
 		return m
 	}
 
-	oldCWD := sessionCWD(sess)
-	if err := loader.RepathSession(sess.FilePath, oldCWD, newCWD); err != nil {
+	oldCWD := slot.meta.CWD
+	if err := loader.RepathSession(slot.meta.FilePath, oldCWD, newCWD); err != nil {
 		m.statusMsg = fmt.Sprintf("repath failed: %v", err)
 		m.repathSessionID = ""
 		m.mode = modeNormal
@@ -972,22 +1090,26 @@ func (m model) doRepath() model {
 	}
 
 	// Reload sessions so grouping reflects the new CWD.
-	newSessions, err := loader.LoadAllSessions(m.currentRoot())
+	newMetas, err := loader.LoadAllSessionsMeta(m.currentRoot(), "")
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("repath ok but reload failed: %v", err)
 		m.repathSessionID = ""
 		m.mode = modeNormal
 		return m
 	}
+	newSlots := make([]*sessionSlot, len(newMetas))
+	for i, meta := range newMetas {
+		newSlots[i] = &sessionSlot{meta: meta}
+	}
 	// Re-select the same session by ID.
 	newIdx := 0
-	for i, s := range newSessions {
-		if s.ID == sess.ID {
+	for i, s := range newSlots {
+		if s.meta.ID == slot.meta.ID {
 			newIdx = i
 			break
 		}
 	}
-	m.sessions = newSessions
+	m.slots = newSlots
 	m.sessionIdx = newIdx
 	m.repathSessionID = ""
 	m.mode = modeNormal
@@ -1152,8 +1274,8 @@ func (m model) statusBar() string {
 			viewLabel = styleArchive.Render("[ARCHIVE]") + " "
 		}
 		sessionInfo := ""
-		if len(m.sessions) > 1 {
-			sessionInfo = fmt.Sprintf(" s list · Tab grouped(%d)", len(m.sessions))
+		if len(m.slots) > 1 {
+			sessionInfo = fmt.Sprintf(" s list · Tab grouped(%d)", len(m.slots))
 		}
 		toolsHint := "t hide tools"
 		if !m.showTools {
@@ -1182,12 +1304,12 @@ func (m model) scrollPct() int {
 }
 
 func (m model) pickerView() string {
-	sess := m.sessions
+	slots := m.slots
 	vh := m.viewHeight()
 
 	// Build picker lines.
-	lines := make([]string, 0, len(sess)+4)
-	title := styleHeader.Render(fmt.Sprintf("Sessions (%d)  ↑↓/jk navigate · n rename · Enter switch · Esc cancel", len(sess)))
+	lines := make([]string, 0, len(slots)+4)
+	title := styleHeader.Render(fmt.Sprintf("Sessions (%d)  ↑↓/jk navigate · n rename · Enter switch · Esc cancel", len(slots)))
 	lines = append(lines, title)
 	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 60))))
 	lines = append(lines, "")
@@ -1201,12 +1323,11 @@ func (m model) pickerView() string {
 		visStart = 0
 	}
 
-	for i := visStart; i < len(sess) && i < visStart+(vh-4); i++ {
-		s := sess[i]
-		ts := m.sessionLabel(s)
-		label := fmt.Sprintf("  %2d  %s", i+1, ts)
+	for i := visStart; i < len(slots) && i < visStart+(vh-4); i++ {
+		sl := m.slotLabel(slots[i])
+		label := fmt.Sprintf("  %2d  %s", i+1, sl)
 		if i == m.sessionIdx {
-			label = fmt.Sprintf("  %2d  %s  ←current", i+1, ts)
+			label = fmt.Sprintf("  %2d  %s  ←current", i+1, sl)
 		}
 		if i == m.pickCursor {
 			lines = append(lines, stylePickSel.Render(label))
@@ -1223,38 +1344,32 @@ func (m model) pickerView() string {
 	return strings.Join(lines[:vh], "\n") + "\n" + styleHelp.Render("press Esc to cancel")
 }
 
-func (m model) sessionLabel(s *parser.Session) string {
-	id := s.ID
+// slotLabel returns a display string for the session picker using metadata
+// and the lazily-loaded preview. Shows "…" while the preview is loading.
+// Custom names from m.names take priority over the preview.
+func (m model) slotLabel(slot *sessionSlot) string {
+	id := slot.meta.ID
 	if len(id) > 16 {
 		id = id[:16]
 	}
-	// Find first user message for preview.
-	preview := ""
 	ts := ""
-	for _, msg := range s.Messages {
-		if !msg.Timestamp.IsZero() && ts == "" {
-			ts = msg.Timestamp.Format("2006-01-02 15:04")
-		}
-		if msg.Role == "user" && preview == "" {
-			preview = strings.TrimSpace(msg.Text)
-			if len(preview) > 50 {
-				preview = preview[:50] + "…"
-			}
-		}
-		if ts != "" && preview != "" {
-			break
-		}
+	if !slot.meta.StartTime.IsZero() {
+		ts = slot.meta.StartTime.Format("2006-01-02 15:04")
 	}
 	if ts == "" {
 		ts = "unknown"
 	}
-	// Use custom name when available; fall back to first-message preview.
-	if custom, ok := m.names[s.ID]; ok && custom != "" {
+	// Use custom name when available; fall back to lazy preview.
+	if custom, ok := m.names[slot.meta.ID]; ok && custom != "" {
 		name := custom
 		if len([]rune(name)) > 50 {
 			name = string([]rune(name)[:50]) + "…"
 		}
 		return fmt.Sprintf("[%s]  %s", ts, name)
+	}
+	preview := slot.preview
+	if !slot.previewLoaded {
+		preview = "…" // loading placeholder
 	}
 	if preview == "" {
 		preview = id
@@ -1322,7 +1437,7 @@ func (m model) helpModalView() string {
 	modalLines = append(modalLines, "  "+sep)
 	modalLines = append(modalLines, "")
 	modalLines = append(modalLines, renderSection("View mode", viewKeys)...)
-	if len(m.sessions) > 1 {
+	if len(m.slots) > 1 {
 		modalLines = append(modalLines, "")
 		modalLines = append(modalLines, "  "+sep)
 		modalLines = append(modalLines, renderSection("Session list  (s)", listKeys)...)
@@ -1474,7 +1589,22 @@ func (m model) infoModalView() string {
 
 func (m *model) rebuildItems() {
 	m.items = nil
-	sess := m.session()
+	slot := m.currentSlot()
+	if slot == nil {
+		m.totalLines = 0
+		return
+	}
+	// Load full session synchronously if the active slot has not been loaded yet.
+	if slot.full == nil && slot.meta.FilePath != "" {
+		sess, err := parser.ParseFile(slot.meta.FilePath)
+		if err == nil {
+			slot.full = sess
+			if slot.meta.ID == "" {
+				slot.meta.ID = sess.ID
+			}
+		}
+	}
+	sess := slot.full
 	if sess == nil {
 		m.totalLines = 0
 		return
@@ -1683,18 +1813,18 @@ func (m *model) renderEditDiff(msgIdx, toolIdx int, tc *parser.ToolCall) []item 
 // doResume launches `claude --resume <session_id>` in the session's CWD,
 // suspending the TUI while claude runs and resuming it when claude exits.
 func (m model) doResume() (tea.Model, tea.Cmd) {
-	sess := m.session()
-	if sess == nil {
+	slot := m.currentSlot()
+	if slot == nil {
 		m.statusMsg = "no session selected"
 		return m, nil
 	}
-	sessionID := sess.ID
+	sessionID := slot.meta.ID
 	if sessionID == "" {
 		m.statusMsg = "session has no ID"
 		return m, nil
 	}
 
-	cwd := sessionCWD(sess)
+	cwd := slot.meta.CWD
 	bin := claudeCmd()
 
 	m.statusMsg = fmt.Sprintf("resuming in %s …", cwd)
@@ -1709,15 +1839,41 @@ func (m model) doResume() (tea.Model, tea.Cmd) {
 	})
 }
 
-// sessionCWD returns the working directory recorded in the session's first
-// message that has a non-empty CWD field.
-func sessionCWD(sess *parser.Session) string {
-	for _, msg := range sess.Messages {
-		if msg.CWD != "" {
-			return msg.CWD
-		}
+// launchPreviewLoads returns a tea.Cmd that asynchronously loads first-message
+// previews for session slots visible in the current picker viewport.
+// Slots already loaded or with no file path are skipped.
+func (m model) launchPreviewLoads() tea.Cmd {
+	vh := m.viewHeight() - 4 // approximate visible picker rows
+	if vh <= 0 {
+		vh = 20
 	}
-	return ""
+	start := m.pickCursor - vh/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + vh
+	if end > len(m.slots) {
+		end = len(m.slots)
+	}
+	var cmds []tea.Cmd
+	for i := start; i < end; i++ {
+		slot := m.slots[i]
+		if slot.previewLoaded || slot.meta.FilePath == "" {
+			continue
+		}
+		// Mark as loading immediately (slots are pointers; this persists).
+		slot.previewLoaded = true
+		idx := i
+		filePath := slot.meta.FilePath
+		cmds = append(cmds, func() tea.Msg {
+			preview := parser.ParseFirstMsgPreview(filePath)
+			return previewLoadedMsg{slotIdx: idx, preview: preview}
+		})
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // claudeCmd returns the claude binary name/path to use.
@@ -1889,21 +2045,21 @@ func abbrevPath(p string) string {
 	return p
 }
 
-// buildGroupRows rebuilds m.groupRows from m.sessions grouped by CWD.
+// buildGroupRows rebuilds m.groupRows from m.slots grouped by CWD.
 // Stable insertion order is preserved.
 func (m *model) buildGroupRows() {
 	type groupEntry struct {
-		cwd          string
-		sessionIdxs  []int
-		newestTs     string
+		cwd           string
+		sessionIdxs   []int
+		newestTs      string
 		newestPreview string
 	}
 
 	var order []string
 	groups := map[string]*groupEntry{}
 
-	for i, s := range m.sessions {
-		cwd := abbrevPath(sessionCWD(s))
+	for i, slot := range m.slots {
+		cwd := abbrevPath(slot.meta.CWD)
 		if _, ok := groups[cwd]; !ok {
 			order = append(order, cwd)
 			groups[cwd] = &groupEntry{cwd: cwd}
@@ -1915,27 +2071,21 @@ func (m *model) buildGroupRows() {
 	// Sort groups alphabetically for deterministic display.
 	sort.Strings(order)
 
-	// Collect newest timestamp + preview for each group.
+	// Collect newest timestamp + preview for each group from metadata.
 	for _, cwd := range order {
 		g := groups[cwd]
 		var newestTs string
 		var newestPreview string
 		for _, idx := range g.sessionIdxs {
-			s := m.sessions[idx]
-			for _, msg := range s.Messages {
-				if !msg.Timestamp.IsZero() {
-					ts := msg.Timestamp.Format("2006-01-02 15:04")
-					if ts > newestTs {
-						newestTs = ts
-					}
+			slot := m.slots[idx]
+			if !slot.meta.EndTime.IsZero() {
+				ts := slot.meta.EndTime.Format("2006-01-02 15:04")
+				if ts > newestTs {
+					newestTs = ts
 				}
-				if msg.Role == "user" && msg.Text != "" && newestPreview == "" {
-					p := strings.TrimSpace(msg.Text)
-					if len([]rune(p)) > 50 {
-						p = string([]rune(p)[:50]) + "…"
-					}
-					newestPreview = p
-				}
+			}
+			if slot.previewLoaded && slot.preview != "" && newestPreview == "" {
+				newestPreview = slot.preview
 			}
 		}
 		g.newestTs = newestTs
@@ -1967,27 +2117,21 @@ func (m *model) buildGroupRows() {
 	}
 }
 
-// groupMeta scans all sessions belonging to cwd and returns the newest
-// timestamp string and first user message preview.
+// groupMeta returns the newest timestamp string and first loaded preview
+// for all slots belonging to cwd.
 func (m model) groupMeta(cwd string) (newestTs, newestPreview string) {
-	for _, s := range m.sessions {
-		if abbrevPath(sessionCWD(s)) != cwd {
+	for _, slot := range m.slots {
+		if abbrevPath(slot.meta.CWD) != cwd {
 			continue
 		}
-		for _, msg := range s.Messages {
-			if !msg.Timestamp.IsZero() {
-				ts := msg.Timestamp.Format("2006-01-02 15:04")
-				if ts > newestTs {
-					newestTs = ts
-				}
+		if !slot.meta.EndTime.IsZero() {
+			ts := slot.meta.EndTime.Format("2006-01-02 15:04")
+			if ts > newestTs {
+				newestTs = ts
 			}
-			if msg.Role == "user" && msg.Text != "" && newestPreview == "" {
-				p := strings.TrimSpace(msg.Text)
-				if len([]rune(p)) > 50 {
-					p = string([]rune(p)[:50]) + "…"
-				}
-				newestPreview = p
-			}
+		}
+		if slot.previewLoaded && slot.preview != "" && newestPreview == "" {
+			newestPreview = slot.preview
 		}
 	}
 	if newestTs == "" {
@@ -2015,7 +2159,7 @@ func (m model) renderGroupRow(i int) string {
 		return styleHeader.Render(label)
 
 	case rowKindSession:
-		sl := m.sessionLabel(m.sessions[row.sessionIdx])
+		sl := m.slotLabel(m.slots[row.sessionIdx])
 		label := fmt.Sprintf("    %s", sl)
 		if row.sessionIdx == m.sessionIdx {
 			label += "  ←current"
@@ -2033,7 +2177,7 @@ func (m model) groupedPickerView() string {
 	vh := m.viewHeight()
 	lines := make([]string, 0, vh)
 
-	title := styleHeader.Render(fmt.Sprintf("Sessions grouped by directory (%d)  Tab=flat · ←/→/Enter=expand · n rename · Esc cancel", len(m.sessions)))
+	title := styleHeader.Render(fmt.Sprintf("Sessions grouped by directory (%d)  Tab=flat · ←/→/Enter=expand · n rename · Esc cancel", len(m.slots)))
 	lines = append(lines, title)
 	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 70))))
 	lines = append(lines, "")
