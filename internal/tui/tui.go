@@ -1,0 +1,787 @@
+// Package tui provides a full-screen terminal UI for browsing session history.
+package tui
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/a2d2-dev/cc-history/internal/parser"
+)
+
+// --------------------------------------------------------------------------
+// Styles
+// --------------------------------------------------------------------------
+
+var (
+	styleUser      = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)   // cyan
+	styleAssistant = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)   // green
+	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))              // yellow
+	styleToolFold  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))              // dark gray
+	styleHelp      = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true) // gray italic
+	styleHeader    = lipgloss.NewStyle().Bold(true)
+	styleBorder    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleMatch     = lipgloss.NewStyle().Background(lipgloss.Color("3")).Foreground(lipgloss.Color("0"))  // yellow bg
+	stylePickSel   = lipgloss.NewStyle().Background(lipgloss.Color("4")).Foreground(lipgloss.Color("15")) // blue bg
+	stylePickBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+)
+
+// --------------------------------------------------------------------------
+// Mode
+// --------------------------------------------------------------------------
+
+type tuiMode int
+
+const (
+	modeNormal tuiMode = iota
+	modePicker         // session list overlay
+	modeSearch         // inline search
+)
+
+// --------------------------------------------------------------------------
+// Model
+// --------------------------------------------------------------------------
+
+// item represents a single rendered line (or block) in the viewport.
+type item struct {
+	text      string // rendered line text (may contain ANSI)
+	plain     string // stripped version for search matching
+	msgIndex  int    // which message this item belongs to (-1 = separator/meta)
+	toolIndex int    // which tool call within that message (-1 = not a tool line)
+}
+
+// model is the bubbletea model for the TUI.
+type model struct {
+	sessions   []*parser.Session
+	sessionIdx int
+	items      []item
+	expanded   map[int]bool // msgIndex -> expanded (tool calls)
+	cursor     int          // viewport top line index
+	height     int          // terminal height
+	width      int          // terminal width
+	showHelp   bool
+	totalLines int
+
+	// search
+	mode        tuiMode
+	searchQuery string
+	matches     []int // item indices that match the search query
+	matchCursor int   // current position in matches
+
+	// session picker
+	pickCursor int
+}
+
+// session returns the currently active session.
+func (m model) session() *parser.Session {
+	if len(m.sessions) == 0 {
+		return nil
+	}
+	return m.sessions[m.sessionIdx]
+}
+
+// --------------------------------------------------------------------------
+// Launch
+// --------------------------------------------------------------------------
+
+// RunTUI starts the TUI with a list of sessions, opening the one at currentIdx.
+// It blocks until the user quits.
+func RunTUI(sessions []*parser.Session, currentIdx int) error {
+	if len(sessions) == 0 {
+		return fmt.Errorf("no sessions to display")
+	}
+	if currentIdx < 0 || currentIdx >= len(sessions) {
+		currentIdx = 0
+	}
+	m := newModelMulti(sessions, currentIdx)
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
+
+// RunSession starts the TUI for a single session and blocks until the user quits.
+// Kept for backward compatibility.
+func RunSession(session *parser.Session) error {
+	return RunTUI([]*parser.Session{session}, 0)
+}
+
+func newModelMulti(sessions []*parser.Session, idx int) model {
+	m := model{
+		sessions:   sessions,
+		sessionIdx: idx,
+		expanded:   make(map[int]bool),
+		height:     24,
+		width:      80,
+	}
+	m.rebuildItems()
+	return m
+}
+
+// newModel creates a model from a single session (used by tests).
+func newModel(session *parser.Session) model {
+	return newModelMulti([]*parser.Session{session}, 0)
+}
+
+// --------------------------------------------------------------------------
+// bubbletea interface
+// --------------------------------------------------------------------------
+
+func (m model) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+		m.width = msg.Width
+		m.rebuildItems()
+		m.clampCursor()
+		return m, nil
+
+	case tea.KeyMsg:
+		switch m.mode {
+		case modePicker:
+			return m.updatePicker(msg)
+		case modeSearch:
+			return m.updateSearch(msg)
+		default:
+			return m.updateNormal(msg)
+		}
+	}
+	return m, nil
+}
+
+func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "Q", "ctrl+c":
+		return m, tea.Quit
+
+	case "?":
+		m.showHelp = !m.showHelp
+
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+
+	case "down", "j":
+		maxTop := m.maxCursor()
+		if m.cursor < maxTop {
+			m.cursor++
+		}
+
+	case "pgup", "b", "ctrl+u":
+		m.cursor -= m.viewHeight()
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+
+	case "pgdown", "f", "ctrl+d":
+		m.cursor += m.viewHeight()
+		m.clampCursor()
+
+	case "home", "g":
+		m.cursor = 0
+
+	case "end", "G":
+		m.cursor = m.maxCursor()
+
+	case "t", "T":
+		msgIdx := m.focusedMsgIndex()
+		if msgIdx >= 0 {
+			m.expanded[msgIdx] = !m.expanded[msgIdx]
+			m.rebuildItems()
+			m.clampCursor()
+		}
+
+	case "s":
+		if len(m.sessions) > 1 {
+			m.mode = modePicker
+			m.pickCursor = m.sessionIdx
+			m.showHelp = false
+		}
+
+	case "/":
+		m.mode = modeSearch
+		m.searchQuery = ""
+		m.matches = nil
+		m.matchCursor = 0
+		m.showHelp = false
+
+	case "n":
+		if len(m.matches) > 0 {
+			m.matchCursor = (m.matchCursor + 1) % len(m.matches)
+			m.scrollToMatch()
+		}
+
+	case "N":
+		if len(m.matches) > 0 {
+			m.matchCursor = (m.matchCursor - 1 + len(m.matches)) % len(m.matches)
+			m.scrollToMatch()
+		}
+	}
+	return m, nil
+}
+
+func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc", "q":
+		m.mode = modeNormal
+
+	case "up", "k":
+		if m.pickCursor > 0 {
+			m.pickCursor--
+		}
+
+	case "down", "j":
+		if m.pickCursor < len(m.sessions)-1 {
+			m.pickCursor++
+		}
+
+	case "enter":
+		if m.pickCursor != m.sessionIdx {
+			m.sessionIdx = m.pickCursor
+			m.expanded = make(map[int]bool)
+			m.cursor = 0
+			m.searchQuery = ""
+			m.matches = nil
+			m.matchCursor = 0
+			m.rebuildItems()
+		}
+		m.mode = modeNormal
+	}
+	return m, nil
+}
+
+func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc":
+		m.mode = modeNormal
+		m.searchQuery = ""
+		m.matches = nil
+		m.matchCursor = 0
+
+	case "enter":
+		// Confirm search, stay in search mode but allow n/N navigation.
+		m.mode = modeNormal
+
+	case "backspace", "ctrl+h":
+		if len(m.searchQuery) > 0 {
+			runes := []rune(m.searchQuery)
+			m.searchQuery = string(runes[:len(runes)-1])
+			m.recomputeMatches()
+		}
+
+	default:
+		if len(msg.Runes) > 0 {
+			m.searchQuery += string(msg.Runes)
+			m.recomputeMatches()
+			if len(m.matches) > 0 {
+				m.matchCursor = 0
+				m.scrollToMatch()
+			}
+		}
+	}
+	return m, nil
+}
+
+// recomputeMatches finds all items matching the current searchQuery.
+func (m *model) recomputeMatches() {
+	m.matches = nil
+	if m.searchQuery == "" {
+		m.matchCursor = 0
+		return
+	}
+	q := strings.ToLower(m.searchQuery)
+	for i, it := range m.items {
+		if strings.Contains(strings.ToLower(it.plain), q) {
+			m.matches = append(m.matches, i)
+		}
+	}
+	if m.matchCursor >= len(m.matches) {
+		m.matchCursor = 0
+	}
+}
+
+// scrollToMatch sets cursor so the current match is visible.
+func (m *model) scrollToMatch() {
+	if len(m.matches) == 0 {
+		return
+	}
+	idx := m.matches[m.matchCursor]
+	// If idx is outside the current viewport, scroll to center it.
+	vh := m.viewHeight()
+	if idx < m.cursor || idx >= m.cursor+vh {
+		m.cursor = idx - vh/2
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		m.clampCursor()
+	}
+}
+
+func (m model) View() string {
+	switch m.mode {
+	case modePicker:
+		return m.pickerView()
+	default:
+		if m.showHelp {
+			return m.helpView()
+		}
+		return m.mainView()
+	}
+}
+
+// --------------------------------------------------------------------------
+// Rendering
+// --------------------------------------------------------------------------
+
+func (m model) mainView() string {
+	vh := m.viewHeight()
+	lines := make([]string, 0, vh)
+
+	end := m.cursor + vh
+	if end > len(m.items) {
+		end = len(m.items)
+	}
+
+	currentMatch := -1
+	if len(m.matches) > 0 && m.matchCursor < len(m.matches) {
+		currentMatch = m.matches[m.matchCursor]
+	}
+
+	for i, it := range m.items[m.cursor:end] {
+		absIdx := m.cursor + i
+		line := it.text
+		// Highlight matched lines.
+		if m.searchQuery != "" && strings.Contains(strings.ToLower(it.plain), strings.ToLower(m.searchQuery)) {
+			if absIdx == currentMatch {
+				line = styleMatch.Render(it.plain)
+			} else {
+				line = styleDim.Render(it.plain)
+			}
+		}
+		lines = append(lines, line)
+	}
+
+	// Pad to fill terminal.
+	for len(lines) < vh {
+		lines = append(lines, "")
+	}
+
+	statusBar := m.statusBar()
+	return strings.Join(lines, "\n") + "\n" + statusBar
+}
+
+func (m model) statusBar() string {
+	pct := 0
+	if len(m.items) > 0 {
+		pct = (m.cursor + m.viewHeight()) * 100 / len(m.items)
+		if pct > 100 {
+			pct = 100
+		}
+	}
+
+	var hint string
+	if m.mode == modeSearch {
+		matchInfo := ""
+		if m.searchQuery != "" {
+			matchInfo = fmt.Sprintf(" [%d matches]", len(m.matches))
+		}
+		hint = styleHelp.Render(fmt.Sprintf("search: %s%s  ESC cancel · Enter confirm · n/N jump", m.searchQuery, matchInfo))
+	} else if m.searchQuery != "" {
+		hint = styleHelp.Render(fmt.Sprintf("/%s  [%d/%d]  n next · N prev · / new search", m.searchQuery, m.matchCursor+1, len(m.matches)))
+	} else {
+		sessionInfo := ""
+		if len(m.sessions) > 1 {
+			sessionInfo = fmt.Sprintf(" s sessions(%d)", len(m.sessions))
+		}
+		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · t toggle tools · / search%s · ? help · q quit", sessionInfo))
+	}
+
+	pos := styleDim.Render(fmt.Sprintf(" %d%%", pct))
+	gap := m.width - lipgloss.Width(hint) - lipgloss.Width(pos)
+	if gap < 0 {
+		gap = 0
+	}
+	return hint + strings.Repeat(" ", gap) + pos
+}
+
+func (m model) pickerView() string {
+	sess := m.sessions
+	vh := m.viewHeight()
+
+	// Build picker lines.
+	lines := make([]string, 0, len(sess)+4)
+	title := styleHeader.Render(fmt.Sprintf("Sessions (%d)  ↑↓/jk navigate · Enter switch · Esc cancel", len(sess)))
+	lines = append(lines, title)
+	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 60))))
+	lines = append(lines, "")
+
+	// Visible window for the list.
+	visStart := 0
+	if m.pickCursor >= vh-4 {
+		visStart = m.pickCursor - (vh - 5)
+	}
+	if visStart < 0 {
+		visStart = 0
+	}
+
+	for i := visStart; i < len(sess) && i < visStart+(vh-4); i++ {
+		s := sess[i]
+		ts := sessionLabel(s)
+		label := fmt.Sprintf("  %2d  %s", i+1, ts)
+		if i == m.sessionIdx {
+			label = fmt.Sprintf("  %2d  %s  ←current", i+1, ts)
+		}
+		if i == m.pickCursor {
+			lines = append(lines, stylePickSel.Render(label))
+		} else {
+			lines = append(lines, label)
+		}
+	}
+
+	// Pad.
+	for len(lines) < vh {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines[:vh], "\n") + "\n" + styleHelp.Render("press Esc to cancel")
+}
+
+func sessionLabel(s *parser.Session) string {
+	id := s.ID
+	if len(id) > 16 {
+		id = id[:16]
+	}
+	// Find first user message for preview.
+	preview := ""
+	ts := ""
+	for _, msg := range s.Messages {
+		if !msg.Timestamp.IsZero() && ts == "" {
+			ts = msg.Timestamp.Format("2006-01-02 15:04")
+		}
+		if msg.Role == "user" && preview == "" {
+			preview = strings.TrimSpace(msg.Text)
+			if len(preview) > 50 {
+				preview = preview[:50] + "…"
+			}
+		}
+		if ts != "" && preview != "" {
+			break
+		}
+	}
+	if ts == "" {
+		ts = "unknown"
+	}
+	if preview == "" {
+		preview = id
+	}
+	return fmt.Sprintf("[%s]  %s", ts, preview)
+}
+
+func (m model) helpView() string {
+	lines := []string{
+		styleHeader.Render("cc-history TUI — keyboard shortcuts"),
+		styleBorder.Render(strings.Repeat("─", 40)),
+		"",
+		"  ↑ / k        scroll up",
+		"  ↓ / j        scroll down",
+		"  PgUp / b     scroll up one page",
+		"  PgDn / f     scroll down one page",
+		"  g / Home     go to top",
+		"  G / End      go to bottom",
+		"  t            toggle tool calls for focused message",
+		"  s            open session switcher",
+		"  /            enter search mode",
+		"  n / N        next / previous search match",
+		"  ?            toggle this help",
+		"  q            quit",
+	}
+	body := strings.Join(lines, "\n")
+	vh := m.viewHeight()
+	bodyLines := strings.Count(body, "\n") + 1
+	for i := bodyLines; i < vh; i++ {
+		body += "\n"
+	}
+	return body + "\n" + styleHelp.Render("press ? to close help")
+}
+
+// --------------------------------------------------------------------------
+// Item builder
+// --------------------------------------------------------------------------
+
+func (m *model) rebuildItems() {
+	m.items = nil
+	sess := m.session()
+	if sess == nil {
+		m.totalLines = 0
+		return
+	}
+	for i, msg := range sess.Messages {
+		if msg.Role == "" {
+			continue
+		}
+		m.items = append(m.items, m.renderMessage(i, msg)...)
+	}
+	m.totalLines = len(m.items)
+	// Recompute matches if search is active.
+	if m.searchQuery != "" {
+		m.recomputeMatches()
+	}
+}
+
+func (m *model) renderMessage(idx int, msg *parser.Message) []item {
+	var items []item
+
+	ts := msg.Timestamp.Format("15:04:05")
+	role, roleStyle := roleLabel(msg.Role)
+
+	// Header line.
+	header := fmt.Sprintf("[%s]  %s", styleDim.Render(ts), roleStyle.Render(role))
+	headerPlain := fmt.Sprintf("[%s]  %s", ts, role)
+
+	// Text content.
+	if text := strings.TrimSpace(msg.Text); text != "" {
+		wrapped := wordWrap(text, m.width-12) // leave room for indent
+		for j, line := range strings.Split(wrapped, "\n") {
+			prefix := "        "
+			prefixPlain := "        "
+			if j == 0 {
+				prefix = header + "  "
+				prefixPlain = headerPlain + "  "
+			}
+			items = append(items, item{
+				text:      prefix + line,
+				plain:     prefixPlain + line,
+				msgIndex:  idx,
+				toolIndex: -1,
+			})
+		}
+	} else {
+		items = append(items, item{
+			text:      header,
+			plain:     headerPlain,
+			msgIndex:  idx,
+			toolIndex: -1,
+		})
+	}
+
+	// Tool calls.
+	for ti, tc := range msg.ToolCalls {
+		items = append(items, m.renderToolCall(idx, ti, tc)...)
+	}
+
+	return items
+}
+
+func (m *model) renderToolCall(msgIdx, toolIdx int, tc *parser.ToolCall) []item {
+	expanded := m.expanded[msgIdx]
+
+	// Folded summary line.
+	sym := "▶"
+	if expanded {
+		sym = "▼"
+	}
+	foldStyle := styleToolFold
+	if expanded {
+		foldStyle = styleTool
+	}
+	summaryPlain := fmt.Sprintf("  %s [tool] %s %s", sym, tc.Name, shortArgs(tc.Arguments))
+	summary := foldStyle.Render(summaryPlain)
+	items := []item{{text: summary, plain: summaryPlain, msgIndex: msgIdx, toolIndex: toolIdx}}
+
+	if !expanded {
+		return items
+	}
+
+	// Expanded: show arguments.
+	if tc.Arguments != "" && tc.Arguments != "{}" {
+		pretty := prettyJSON(tc.Arguments)
+		for _, line := range strings.Split(pretty, "\n") {
+			items = append(items, item{
+				text:      styleTool.Render("     │ ") + line,
+				plain:     "     │ " + line,
+				msgIndex:  msgIdx,
+				toolIndex: toolIdx,
+			})
+		}
+	}
+
+	// Expanded: show result.
+	if tc.Result != "" {
+		label := styleToolFold.Render("  result: ")
+		labelPlain := "  result: "
+		wrapped := wordWrap(tc.Result, m.width-14)
+		for j, line := range strings.Split(wrapped, "\n") {
+			prefix := "           "
+			prefixPlain := "           "
+			if j == 0 {
+				prefix = label
+				prefixPlain = labelPlain
+			}
+			items = append(items, item{
+				text:      prefix + line,
+				plain:     prefixPlain + line,
+				msgIndex:  msgIdx,
+				toolIndex: toolIdx,
+			})
+		}
+	}
+
+	return items
+}
+
+// --------------------------------------------------------------------------
+// Helpers
+// --------------------------------------------------------------------------
+
+func roleLabel(role string) (string, lipgloss.Style) {
+	switch role {
+	case "user":
+		return "user", styleUser
+	case "assistant":
+		return "asst", styleAssistant
+	default:
+		return fmt.Sprintf("%-4s", role), styleTool
+	}
+}
+
+func shortArgs(raw string) string {
+	if raw == "" || raw == "{}" {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		if len(raw) > 60 {
+			return raw[:60] + "…"
+		}
+		return raw
+	}
+	var parts []string
+	count := 0
+	for k, v := range m {
+		if count >= 2 {
+			parts = append(parts, "…")
+			break
+		}
+		vs := fmt.Sprintf("%v", v)
+		vs = strings.ReplaceAll(vs, "\n", "\\n")
+		if len(vs) > 40 {
+			vs = vs[:40] + "…"
+		}
+		parts = append(parts, k+"="+vs)
+		count++
+	}
+	return strings.Join(parts, " ")
+}
+
+func prettyJSON(raw string) string {
+	var v interface{}
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return raw
+	}
+	b, err := json.MarshalIndent(v, "     ", "  ")
+	if err != nil {
+		return raw
+	}
+	return string(b)
+}
+
+// wordWrap wraps s at maxWidth runes.
+func wordWrap(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		maxWidth = 80
+	}
+	var sb strings.Builder
+	for _, para := range strings.Split(s, "\n") {
+		words := strings.Fields(para)
+		if len(words) == 0 {
+			sb.WriteByte('\n')
+			continue
+		}
+		lineLen := 0
+		for i, w := range words {
+			wlen := len([]rune(w))
+			if lineLen > 0 && lineLen+1+wlen > maxWidth {
+				sb.WriteByte('\n')
+				lineLen = 0
+			} else if i > 0 {
+				sb.WriteByte(' ')
+				lineLen++
+			}
+			sb.WriteString(w)
+			lineLen += wlen
+		}
+		sb.WriteByte('\n')
+	}
+	result := sb.String()
+	// Trim trailing newline added by the loop.
+	return strings.TrimRight(result, "\n")
+}
+
+// ansiEscape matches ANSI escape sequences for stripping.
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// stripANSI removes ANSI color codes from a string.
+func stripANSI(s string) string {
+	return ansiEscape.ReplaceAllString(s, "")
+}
+
+func (m model) viewHeight() int {
+	h := m.height - 1 // reserve status bar
+	if h < 1 {
+		return 1
+	}
+	return h
+}
+
+func (m model) maxCursor() int {
+	max := len(m.items) - m.viewHeight()
+	if max < 0 {
+		return 0
+	}
+	return max
+}
+
+func (m *model) clampCursor() {
+	max := m.maxCursor()
+	if m.cursor > max {
+		m.cursor = max
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+}
+
+// focusedMsgIndex returns the message index at the approximate center of the
+// visible viewport, used for the `t` key binding.
+func (m model) focusedMsgIndex() int {
+	mid := m.cursor + m.viewHeight()/2
+	if mid >= len(m.items) {
+		mid = len(m.items) - 1
+	}
+	if mid < 0 {
+		return -1
+	}
+	return m.items[mid].msgIndex
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
