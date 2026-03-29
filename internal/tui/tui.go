@@ -48,12 +48,13 @@ var (
 type tuiMode int
 
 const (
-	modeNormal tuiMode = iota
-	modePicker         // session list overlay
-	modeSearch         // inline search
-	modeInfo           // session info modal
-	modeHelp           // help modal overlay
-	modeRename         // inline rename input (status bar)
+	modeNormal  tuiMode = iota
+	modePicker          // session list overlay
+	modeSearch          // inline search
+	modeInfo            // session info modal
+	modeHelp            // help modal overlay
+	modeRename          // inline rename input (status bar)
+	modeConfirm         // y/n confirmation prompt (e.g. duplicate)
 )
 
 // --------------------------------------------------------------------------
@@ -128,8 +129,8 @@ type model struct {
 	groupPickCursor int            // cursor position in groupRows
 
 	// archive / restore
-	sessionsRoot string        // live sessions root (e.g. ~/.claude/projects)
-	showArchived bool          // true = currently viewing archived sessions
+	sessionsRoot string         // live sessions root (e.g. ~/.claude/projects)
+	showArchived bool           // true = currently viewing archived sessions
 	lastAction   *archiveAction // last archive/restore action (for undo)
 	statusMsg    string         // transient one-line status displayed in status bar
 
@@ -138,6 +139,10 @@ type model struct {
 	renameInput      string            // current text in rename input
 	renamingSessionID string           // session being renamed
 	renameReturnMode tuiMode           // mode to restore after rename completes
+
+	// duplicate confirm
+	duplicatingSessionID string  // session pending duplication confirmation
+	confirmReturnMode    tuiMode // mode to restore if confirm is cancelled
 }
 
 // resumeFinishedMsg is sent back by the ExecProcess callback after claude exits.
@@ -244,6 +249,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateHelp(msg)
 		case modeRename:
 			return m.updateRename(msg)
+		case modeConfirm:
+			return m.updateConfirm(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -357,6 +364,11 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "r":
 		return m.doResume()
+
+	case "d":
+		if sess := m.session(); sess != nil {
+			m = m.startConfirmDuplicate(sess.ID, modeNormal)
+		}
 	}
 	return m, nil
 }
@@ -558,6 +570,85 @@ func (m model) updateRename(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// startConfirmDuplicate enters confirm mode for the given session ID.
+func (m model) startConfirmDuplicate(sessionID string, returnMode tuiMode) model {
+	m.duplicatingSessionID = sessionID
+	m.confirmReturnMode = returnMode
+	m.mode = modeConfirm
+	return m
+}
+
+// updateConfirm handles key events while the y/n duplicate confirmation is active.
+func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "y", "Y":
+		m = m.doDuplicate()
+		m.duplicatingSessionID = ""
+	case "esc", "n", "N", "q":
+		m.statusMsg = "duplicate cancelled"
+		m.duplicatingSessionID = ""
+		m.mode = m.confirmReturnMode
+	}
+	return m, nil
+}
+
+// doDuplicate copies the session file with a new UUID and reloads the session list.
+func (m model) doDuplicate() model {
+	if m.sessionsRoot == "" {
+		m.statusMsg = "duplicate unavailable: no session root"
+		m.mode = m.confirmReturnMode
+		return m
+	}
+	sess := m.session()
+	if sess == nil || sess.ID != m.duplicatingSessionID {
+		// Fall back to finding the target session.
+		for _, s := range m.sessions {
+			if s.ID == m.duplicatingSessionID {
+				sess = s
+				break
+			}
+		}
+	}
+	if sess == nil {
+		m.statusMsg = "duplicate failed: session not found"
+		m.mode = m.confirmReturnMode
+		return m
+	}
+
+	_, newID, err := loader.DuplicateSession(sess.FilePath)
+	if err != nil {
+		m.statusMsg = fmt.Sprintf("duplicate failed: %v", err)
+		m.mode = m.confirmReturnMode
+		return m
+	}
+
+	// Reload sessions from disk.
+	newSessions, err := loader.LoadAllSessions(m.currentRoot())
+	if err != nil {
+		m.statusMsg = fmt.Sprintf("duplicate ok (%s) but reload failed: %v", newID[:8], err)
+		m.mode = m.confirmReturnMode
+		return m
+	}
+	m.sessions = newSessions
+	// Keep current session selected (find by original ID).
+	for i, s := range m.sessions {
+		if s.ID == sess.ID {
+			m.sessionIdx = i
+			break
+		}
+	}
+	m.expanded = make(map[int]bool)
+	m.cursor = 0
+	m.matches = nil
+	m.matchCursor = 0
+	m.rebuildItems()
+	m.statusMsg = fmt.Sprintf("duplicated: %s", newID[:8]+"…")
+	m.mode = m.confirmReturnMode
+	return m
+}
+
 func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.groupedPicker {
 		return m.updateGroupedPicker(msg)
@@ -600,6 +691,11 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildItems()
 		}
 		m.mode = modeNormal
+
+	case "d":
+		if m.pickCursor < len(m.sessions) {
+			m = m.startConfirmDuplicate(m.sessions[m.pickCursor].ID, modePicker)
+		}
 	}
 	return m, nil
 }
@@ -664,6 +760,14 @@ func (m model) updateGroupedPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.rebuildItems()
 			}
 			m.mode = modeNormal
+		}
+
+	case "d":
+		if len(m.groupRows) > 0 {
+			row := m.groupRows[m.groupPickCursor]
+			if row.kind == rowKindSession && row.sessionIdx < len(m.sessions) {
+				m = m.startConfirmDuplicate(m.sessions[row.sessionIdx].ID, modePicker)
+			}
 		}
 	}
 	return m, nil
@@ -839,6 +943,13 @@ func (m model) statusBar() string {
 		return m.statusMsg + strings.Repeat(" ", gap) + pos
 	}
 
+	// Confirm mode shows an inline y/n prompt.
+	if m.mode == modeConfirm {
+		cursor := styleOK.Render("▋")
+		hint := styleHelp.Render(fmt.Sprintf("Duplicate session? y to confirm · n/Esc to cancel%s", cursor))
+		return hint
+	}
+
 	var hint string
 	if m.mode == modeSearch {
 		matchInfo := ""
@@ -861,7 +972,7 @@ func (m model) statusBar() string {
 		if !m.showTools {
 			toolsHint = "t show tools"
 		}
-		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
+		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · d dup · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
@@ -983,6 +1094,7 @@ func (m model) helpModalView() string {
 		{"i", "show session info"},
 		{"r", "resume session (claude --resume)"},
 		{"n", "rename session (custom title)"},
+		{"d", "duplicate session (copy with new UUID)"},
 		{"a", "archive session (restore in archive view)"},
 		{"A", "toggle live / archive view"},
 		{"u", "undo last archive / restore"},
