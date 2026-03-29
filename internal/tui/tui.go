@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
@@ -132,6 +133,9 @@ type model struct {
 	statusMsg    string         // transient one-line status displayed in status bar
 }
 
+// resumeFinishedMsg is sent back by the ExecProcess callback after claude exits.
+type resumeFinishedMsg struct{ err error }
+
 // session returns the currently active session.
 func (m model) session() *parser.Session {
 	if len(m.sessions) == 0 {
@@ -210,6 +214,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.rebuildItems()
 		m.clampCursor()
+		return m, nil
+
+	case resumeFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("resume error: %v", msg.err)
+		} else {
+			m.statusMsg = "returned from claude"
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -328,6 +340,9 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "u":
 		m = m.doUndo()
+
+	case "r":
+		return m.doResume()
 	}
 	return m, nil
 }
@@ -751,7 +766,7 @@ func (m model) statusBar() string {
 		if !m.showTools {
 			toolsHint = "t show tools"
 		}
-		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
+		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
@@ -863,6 +878,7 @@ func (m model) helpModalView() string {
 		{"t", "hide / show all tool calls"},
 		{"T", "expand / collapse tool details for focused message"},
 		{"i", "show session info"},
+		{"r", "resume session (claude --resume)"},
 		{"a", "archive session (restore in archive view)"},
 		{"A", "toggle live / archive view"},
 		{"u", "undo last archive / restore"},
@@ -1256,6 +1272,59 @@ func (m *model) renderEditDiff(msgIdx, toolIdx int, tc *parser.ToolCall) []item 
 }
 
 // --------------------------------------------------------------------------
+// Resume
+// --------------------------------------------------------------------------
+
+// doResume launches `claude --resume <session_id>` in the session's CWD,
+// suspending the TUI while claude runs and resuming it when claude exits.
+func (m model) doResume() (tea.Model, tea.Cmd) {
+	sess := m.session()
+	if sess == nil {
+		m.statusMsg = "no session selected"
+		return m, nil
+	}
+	sessionID := sess.ID
+	if sessionID == "" {
+		m.statusMsg = "session has no ID"
+		return m, nil
+	}
+
+	cwd := sessionCWD(sess)
+	bin := claudeCmd()
+
+	m.statusMsg = fmt.Sprintf("resuming in %s …", cwd)
+
+	c := exec.Command(bin, "--resume", sessionID)
+	if cwd != "" {
+		c.Dir = cwd
+	}
+
+	return m, tea.ExecProcess(c, func(err error) tea.Msg {
+		return resumeFinishedMsg{err: err}
+	})
+}
+
+// sessionCWD returns the working directory recorded in the session's first
+// message that has a non-empty CWD field.
+func sessionCWD(sess *parser.Session) string {
+	for _, msg := range sess.Messages {
+		if msg.CWD != "" {
+			return msg.CWD
+		}
+	}
+	return ""
+}
+
+// claudeCmd returns the claude binary name/path to use.
+// Controlled by the CLAUDE_COMMAND environment variable; defaults to "claude".
+func claudeCmd() string {
+	if v := os.Getenv("CLAUDE_COMMAND"); v != "" {
+		return v
+	}
+	return "claude"
+}
+
+// --------------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------------
 
@@ -1402,16 +1471,6 @@ func (m model) focusedMsgIndex() int {
 // --------------------------------------------------------------------------
 // Grouped session list helpers
 // --------------------------------------------------------------------------
-
-// sessionCWD returns the first non-empty CWD found in a session's messages.
-func sessionCWD(s *parser.Session) string {
-	for _, msg := range s.Messages {
-		if msg.CWD != "" {
-			return msg.CWD
-		}
-	}
-	return ""
-}
 
 // abbrevPath replaces the home directory prefix with "~".
 func abbrevPath(p string) string {
