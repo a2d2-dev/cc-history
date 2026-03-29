@@ -16,6 +16,9 @@ func main() {
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	pathFlag := flag.String("path", "", "session directory (default: ~/.claude/projects)")
 	regexFlag := flag.Bool("E", false, "treat pattern as extended regular expression")
+	afterFlag := flag.Int("A", 0, "show N messages after each match")
+	beforeFlag := flag.Int("B", 0, "show N messages before each match")
+	contextFlag := flag.Int("C", 0, "show N messages before and after each match")
 	flag.Parse()
 
 	if *versionFlag {
@@ -54,7 +57,23 @@ func main() {
 		return
 	}
 
-	if err := display.FilterSession(os.Stdout, session, pattern, *regexFlag); err != nil {
+	after := *afterFlag
+	before := *beforeFlag
+	if *contextFlag > 0 {
+		if after < *contextFlag {
+			after = *contextFlag
+		}
+		if before < *contextFlag {
+			before = *contextFlag
+		}
+	}
+
+	opts := display.FilterOptions{
+		UseRegex: *regexFlag,
+		After:    after,
+		Before:   before,
+	}
+	if err := display.FilterSession(os.Stdout, session, pattern, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
