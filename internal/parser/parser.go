@@ -85,6 +85,8 @@ type Message struct {
 	ToolCalls []*ToolCall
 	// ToolResults is populated for user messages that return tool output.
 	ToolResults []*ToolResult
+	// HasThinking is true when the message contained at least one thinking block.
+	HasThinking bool
 	// TurnDurationMs is set for system/turn_duration records.
 	TurnDurationMs float64
 }
@@ -103,9 +105,99 @@ type ToolCall struct {
 // ToolResult is the output of a tool call, found in a user message.
 type ToolResult struct {
 	ToolUseID  string
+	ToolName   string // populated during link pass from matching ToolCall
 	Content    string
 	IsError    bool
 	DurationMs float64
+}
+
+// SessionMeta holds lightweight session metadata populated without full content
+// parsing. It is used by --list to avoid reading entire session files.
+type SessionMeta struct {
+	ID          string
+	FilePath    string
+	StartTime   time.Time
+	EndTime     time.Time
+	// LastMessage is only populated when ParseFileMeta is called with
+	// parseLastMsg=true (i.e. for the current session).
+	LastMessage *Message
+}
+
+// rawMetaRecord is a minimal JSON envelope used for fast metadata scans.
+// Deliberately omits the Message field so the JSON decoder skips it without
+// allocating, making the scan ~10x faster for sessions with large tool output.
+type rawMetaRecord struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionId"`
+	Timestamp string `json:"timestamp"`
+}
+
+// ParseFileMeta scans path to extract session metadata without parsing message
+// content. If parseLastMsg is true, the last message with a role is fully
+// parsed and stored in SessionMeta.LastMessage.
+func ParseFileMeta(path string, parseLastMsg bool) (*SessionMeta, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	meta := &SessionMeta{FilePath: path}
+
+	// Use a large scanner buffer: even though we skip content, the scanner
+	// must read full lines to call json.Unmarshal.
+	const maxBuf = 16 * 1024 * 1024
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, maxBuf), maxBuf)
+
+	// lastRoleBytes holds the raw bytes of the last line whose type is a role
+	// message (user/assistant). Used only when parseLastMsg is true.
+	var lastRoleBytes []byte
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var rec rawMetaRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue
+		}
+
+		if meta.ID == "" && rec.SessionID != "" {
+			meta.ID = rec.SessionID
+		}
+		if rec.Timestamp != "" {
+			t, _ := time.Parse(time.RFC3339Nano, rec.Timestamp)
+			if !t.IsZero() {
+				if meta.StartTime.IsZero() {
+					meta.StartTime = t
+				}
+				meta.EndTime = t
+			}
+		}
+		if parseLastMsg && (rec.Type == "user" || rec.Type == "assistant") {
+			lastRoleBytes = make([]byte, len(line))
+			copy(lastRoleBytes, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan %s: %w", path, err)
+	}
+
+	// Full-parse only the last role line for the current session.
+	if parseLastMsg && lastRoleBytes != nil {
+		var fullRec rawRecord
+		if err := json.Unmarshal(lastRoleBytes, &fullRec); err == nil {
+			msg := buildMessage(&fullRec)
+			if msg.Role != "" {
+				meta.LastMessage = msg
+			}
+		}
+	}
+
+	return meta, nil
 }
 
 // --------------------------------------------------------------------------
@@ -174,12 +266,14 @@ func ParseReader(filePath string, r io.Reader) (*Session, error) {
 		return nil, fmt.Errorf("scan %s: %w", filePath, err)
 	}
 
-	// Link pass: populate ToolCall.Result/IsError/DurationMs from matching results.
+	// Link pass: populate ToolCall.Result/IsError/DurationMs from matching results,
+	// and back-fill ToolResult.ToolName from the matching ToolCall.
 	for id, tr := range toolResultMap {
 		if tc, ok := toolCallMap[id]; ok {
 			tc.Result = tr.Content
 			tc.IsError = tr.IsError
 			tc.DurationMs = tr.DurationMs
+			tr.ToolName = tc.Name
 		}
 	}
 
@@ -267,7 +361,9 @@ func parseContent(msg *Message, rec *rawRecord) {
 					IsError:    item.IsError,
 					DurationMs: dur,
 				})
-			// "thinking" blocks are internal reasoning; skip.
+			case "thinking":
+				// Internal reasoning; do not extract text, but mark presence.
+				msg.HasThinking = true
 			}
 		}
 		msg.Text = strings.Join(textParts, "\n")

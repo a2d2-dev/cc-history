@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/a2d2-dev/cc-history/internal/display"
 	ccexport "github.com/a2d2-dev/cc-history/internal/export"
@@ -14,7 +15,19 @@ import (
 
 const version = "0.1.0"
 
+// isTerminal reports whether f is connected to a terminal.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func main() {
+	// Enable ANSI colors when stdout is a terminal.
+	display.UseColors = isTerminal(os.Stdout)
+
 	// Top-level flags.
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	pathFlag := flag.String("path", "", "session directory (default: ~/.claude/projects)")
@@ -24,6 +37,10 @@ func main() {
 	contextFlag := flag.Int("C", 0, "show N messages before and after each match")
 	allFlag := flag.Bool("all", false, "show all sessions sorted by time")
 	noSepFlag := flag.Bool("no-sep", false, "disable session separator lines (use with --all)")
+	listFlag := flag.Bool("list", false, "list all sessions; mark current session and show its last message")
+	flag.BoolVar(listFlag, "l", false, "alias for --list")
+	sinceFlag := flag.String("since", "", "only show messages on or after this date (YYYY-MM-DD)")
+	untilFlag := flag.String("until", "", "only show messages on or before this date (YYYY-MM-DD)")
 	tuiFlag := flag.Bool("tui", false, "open full-screen TUI for the current session")
 	interactiveFlag := flag.Bool("i", false, "alias for --tui")
 	flag.Parse()
@@ -56,6 +73,25 @@ func main() {
 		After:    after,
 		Before:   before,
 	}
+
+	// Parse --since and --until date flags (YYYY-MM-DD, UTC).
+	if *sinceFlag != "" {
+		t, err := time.Parse("2006-01-02", *sinceFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid --since date %q (expected YYYY-MM-DD)\n", *sinceFlag)
+			os.Exit(1)
+		}
+		opts.Since = t.UTC()
+	}
+	if *untilFlag != "" {
+		t, err := time.Parse("2006-01-02", *untilFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid --until date %q (expected YYYY-MM-DD)\n", *untilFlag)
+			os.Exit(1)
+		}
+		opts.Until = t.UTC()
+	}
+
 	pattern := flag.Arg(0)
 
 	if *tuiFlag || *interactiveFlag {
@@ -89,19 +125,31 @@ func main() {
 		return
 	}
 
+	if *listFlag {
+		currentPath, _, _ := loader.FindCurrentSession(root)
+		metas, err := loader.LoadAllSessionsMeta(root, currentPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		display.ListSessions(os.Stdout, metas, currentPath)
+		return
+	}
+
 	if *allFlag {
 		sessions, err := loader.LoadAllSessions(root)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		if pattern == "" {
-			display.PrintAllSessions(os.Stdout, sessions, *noSepFlag)
-		} else {
+		// Route through FilterAllSessions when a pattern or date filters are set.
+		if pattern != "" || !opts.Since.IsZero() || !opts.Until.IsZero() {
 			if err := display.FilterAllSessions(os.Stdout, sessions, pattern, opts, *noSepFlag); err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
 			}
+		} else {
+			display.PrintAllSessions(os.Stdout, sessions, *noSepFlag)
 		}
 		return
 	}
@@ -121,15 +169,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	if pattern == "" {
-		display.PrintSession(os.Stdout, session)
+	// Route through FilterSession when a pattern or date filters are set.
+	if pattern != "" || !opts.Since.IsZero() || !opts.Until.IsZero() {
+		if err := display.FilterSession(os.Stdout, session, pattern, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
-	if err := display.FilterSession(os.Stdout, session, pattern, opts); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
+	display.PrintSession(os.Stdout, session)
 }
 
 // runExport handles the "export" subcommand.

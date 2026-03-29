@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/a2d2-dev/cc-history/internal/parser"
 )
@@ -69,6 +70,64 @@ func PrintAllSessions(w io.Writer, sessions []*parser.Session, noSep bool) {
 	}
 }
 
+// ListSessions writes a compact one-line summary per session meta to w.
+// Sessions are expected to be pre-sorted by StartTime (oldest first).
+// The session whose FilePath equals currentFilePath is marked with "►" and
+// followed by its LastMessage (if populated).
+func ListSessions(w io.Writer, metas []*parser.SessionMeta, currentFilePath string) {
+	for _, m := range metas {
+		isCurrent := m.FilePath == currentFilePath
+
+		idStr := m.ID
+		if len(idStr) > 8 {
+			idStr = idStr[:8]
+		}
+
+		var timeRange string
+		if !m.StartTime.IsZero() {
+			if m.StartTime.Format("2006-01-02") == m.EndTime.Format("2006-01-02") {
+				timeRange = m.StartTime.Format("2006-01-02 15:04") + " – " + m.EndTime.Format("15:04")
+			} else {
+				timeRange = m.StartTime.Format("2006-01-02 15:04") + " – " + m.EndTime.Format("2006-01-02 15:04")
+			}
+		}
+
+		marker := "  "
+		if isCurrent {
+			marker = colorize(colorCyan, "► ")
+		}
+
+		fmt.Fprintf(w, "%s%-8s  %s  %s\n", marker, idStr, m.FilePath, timeRange)
+
+		// For the current session, print its last message indented.
+		if isCurrent && m.LastMessage != nil {
+			msg := m.LastMessage
+			ts := msg.Timestamp.Format("15:04:05")
+			role := formatRole(msg.Role)
+			var content string
+			switch {
+			case strings.TrimSpace(msg.Text) != "":
+				content = truncate(strings.TrimSpace(msg.Text), summaryMaxRunes)
+			case len(msg.ToolCalls) > 0:
+				tc := msg.ToolCalls[len(msg.ToolCalls)-1]
+				content = fmt.Sprintf("[%s %s]", tc.Name, formatArgs(tc.Arguments))
+			case len(msg.ToolResults) > 0:
+				tr := msg.ToolResults[0]
+				if tr.IsError {
+					name := tr.ToolName
+					if name == "" {
+						name = tr.ToolUseID
+					}
+					content = colorize(colorRed, "[tool error: "+name+"]")
+				}
+			}
+			if content != "" {
+				fmt.Fprintf(w, "    [%s]  %s  %s\n", ts, role, content)
+			}
+		}
+	}
+}
+
 // FilterAllSessions writes messages from all sessions that match pattern,
 // with optional context lines. Separators are printed at session boundaries
 // (unless noSep is true) and "--" is printed between non-contiguous groups.
@@ -87,7 +146,7 @@ func FilterAllSessions(w io.Writer, sessions []*parser.Session, pattern string, 
 	}
 	visible := make([]visEntry, 0, len(all))
 	for i, sm := range all {
-		if sm.msg.Role != "" {
+		if sm.msg.Role != "" && opts.inDateRange(sm.msg.Timestamp) {
 			visible = append(visible, visEntry{idx: i, session: sm.session})
 		}
 	}
