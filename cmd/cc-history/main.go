@@ -36,6 +36,8 @@ func main() {
 	contextFlag := flag.Int("C", 0, "show N messages before and after each match")
 	allFlag := flag.Bool("all", false, "show all sessions sorted by time")
 	noSepFlag := flag.Bool("no-sep", false, "disable session separator lines (use with --all)")
+	listFlag := flag.Bool("list", false, "list all sessions; mark current session and show its last message")
+	flag.BoolVar(listFlag, "l", false, "alias for --list")
 	tuiFlag := flag.Bool("tui", false, "open full-screen TUI for the current session")
 	interactiveFlag := flag.Bool("i", false, "alias for --tui")
 	flag.Parse()
@@ -98,6 +100,17 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+		return
+	}
+
+	if *listFlag {
+		sessions, err := loader.LoadAllSessions(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		currentPath, _, _ := loader.FindCurrentSession(root)
+		display.ListSessions(os.Stdout, sessions, currentPath)
 		return
 	}
 
