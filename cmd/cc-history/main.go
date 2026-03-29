@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/a2d2-dev/cc-history/internal/display"
 	ccexport "github.com/a2d2-dev/cc-history/internal/export"
 	"github.com/a2d2-dev/cc-history/internal/loader"
 	"github.com/a2d2-dev/cc-history/internal/parser"
@@ -31,15 +32,22 @@ func main() {
 
 	root := resolveRoot(*pathFlag)
 
-	files, err := loader.ScanJSONL(root)
+	sessionPath, isFallback, err := loader.FindCurrentSession(root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if isFallback {
+		fmt.Fprintf(os.Stderr, "note: CLAUDE_SESSION_ID not set — showing most recent session\n")
+	}
+
+	session, err := parser.ParseFile(sessionPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	for _, f := range files {
-		fmt.Println(f)
-	}
+	display.PrintSession(os.Stdout, session)
 }
 
 // runExport handles the "export" subcommand.
