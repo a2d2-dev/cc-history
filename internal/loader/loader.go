@@ -165,7 +165,6 @@ func FindCurrentSession(root string) (path string, isFallback bool, err error) {
 	}
 	return newest.Path, true, nil
 }
-<<<<<<< HEAD
 
 // FindSessionByID locates the JSONL file whose session ID matches id.
 // It first checks filenames (id.jsonl), then scans the first line of each file.

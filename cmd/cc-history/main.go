@@ -21,6 +21,8 @@ func main() {
 	afterFlag := flag.Int("A", 0, "show N messages after each match")
 	beforeFlag := flag.Int("B", 0, "show N messages before each match")
 	contextFlag := flag.Int("C", 0, "show N messages before and after each match")
+	allFlag := flag.Bool("all", false, "show all sessions sorted by time")
+	noSepFlag := flag.Bool("no-sep", false, "disable session separator lines (use with --all)")
 	flag.Parse()
 
 	if *versionFlag {
@@ -35,6 +37,40 @@ func main() {
 	}
 
 	root := resolveRoot(*pathFlag)
+
+	after := *afterFlag
+	before := *beforeFlag
+	if *contextFlag > 0 {
+		if after < *contextFlag {
+			after = *contextFlag
+		}
+		if before < *contextFlag {
+			before = *contextFlag
+		}
+	}
+	opts := display.FilterOptions{
+		UseRegex: *regexFlag,
+		After:    after,
+		Before:   before,
+	}
+	pattern := flag.Arg(0)
+
+	if *allFlag {
+		sessions, err := loader.LoadAllSessions(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if pattern == "" {
+			display.PrintAllSessions(os.Stdout, sessions, *noSepFlag)
+		} else {
+			if err := display.FilterAllSessions(os.Stdout, sessions, pattern, opts, *noSepFlag); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		return
+	}
 
 	sessionPath, isFallback, err := loader.FindCurrentSession(root)
 	if err != nil {
@@ -51,28 +87,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	pattern := flag.Arg(0)
 	if pattern == "" {
 		display.PrintSession(os.Stdout, session)
 		return
 	}
 
-	after := *afterFlag
-	before := *beforeFlag
-	if *contextFlag > 0 {
-		if after < *contextFlag {
-			after = *contextFlag
-		}
-		if before < *contextFlag {
-			before = *contextFlag
-		}
-	}
-
-	opts := display.FilterOptions{
-		UseRegex: *regexFlag,
-		After:    after,
-		Before:   before,
-	}
 	if err := display.FilterSession(os.Stdout, session, pattern, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
