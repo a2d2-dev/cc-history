@@ -9,6 +9,7 @@ import (
 	ccexport "github.com/a2d2-dev/cc-history/internal/export"
 	"github.com/a2d2-dev/cc-history/internal/loader"
 	"github.com/a2d2-dev/cc-history/internal/parser"
+	"github.com/a2d2-dev/cc-history/internal/tui"
 )
 
 const version = "0.1.0"
@@ -23,6 +24,8 @@ func main() {
 	contextFlag := flag.Int("C", 0, "show N messages before and after each match")
 	allFlag := flag.Bool("all", false, "show all sessions sorted by time")
 	noSepFlag := flag.Bool("no-sep", false, "disable session separator lines (use with --all)")
+	tuiFlag := flag.Bool("tui", false, "open full-screen TUI for the current session")
+	interactiveFlag := flag.Bool("i", false, "alias for --tui")
 	flag.Parse()
 
 	if *versionFlag {
@@ -54,6 +57,27 @@ func main() {
 		Before:   before,
 	}
 	pattern := flag.Arg(0)
+
+	if *tuiFlag || *interactiveFlag {
+		sessionPath, isFallback, err := loader.FindCurrentSession(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if isFallback {
+			fmt.Fprintf(os.Stderr, "note: CLAUDE_SESSION_ID not set — opening most recent session\n")
+		}
+		session, err := parser.ParseFile(sessionPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := tui.RunSession(session); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *allFlag {
 		sessions, err := loader.LoadAllSessions(root)
