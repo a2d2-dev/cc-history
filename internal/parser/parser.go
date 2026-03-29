@@ -111,6 +111,95 @@ type ToolResult struct {
 	DurationMs float64
 }
 
+// SessionMeta holds lightweight session metadata populated without full content
+// parsing. It is used by --list to avoid reading entire session files.
+type SessionMeta struct {
+	ID          string
+	FilePath    string
+	StartTime   time.Time
+	EndTime     time.Time
+	// LastMessage is only populated when ParseFileMeta is called with
+	// parseLastMsg=true (i.e. for the current session).
+	LastMessage *Message
+}
+
+// rawMetaRecord is a minimal JSON envelope used for fast metadata scans.
+// Deliberately omits the Message field so the JSON decoder skips it without
+// allocating, making the scan ~10x faster for sessions with large tool output.
+type rawMetaRecord struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionId"`
+	Timestamp string `json:"timestamp"`
+}
+
+// ParseFileMeta scans path to extract session metadata without parsing message
+// content. If parseLastMsg is true, the last message with a role is fully
+// parsed and stored in SessionMeta.LastMessage.
+func ParseFileMeta(path string, parseLastMsg bool) (*SessionMeta, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	meta := &SessionMeta{FilePath: path}
+
+	// Use a large scanner buffer: even though we skip content, the scanner
+	// must read full lines to call json.Unmarshal.
+	const maxBuf = 16 * 1024 * 1024
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, maxBuf), maxBuf)
+
+	// lastRoleBytes holds the raw bytes of the last line whose type is a role
+	// message (user/assistant). Used only when parseLastMsg is true.
+	var lastRoleBytes []byte
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var rec rawMetaRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue
+		}
+
+		if meta.ID == "" && rec.SessionID != "" {
+			meta.ID = rec.SessionID
+		}
+		if rec.Timestamp != "" {
+			t, _ := time.Parse(time.RFC3339Nano, rec.Timestamp)
+			if !t.IsZero() {
+				if meta.StartTime.IsZero() {
+					meta.StartTime = t
+				}
+				meta.EndTime = t
+			}
+		}
+		if parseLastMsg && (rec.Type == "user" || rec.Type == "assistant") {
+			lastRoleBytes = make([]byte, len(line))
+			copy(lastRoleBytes, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan %s: %w", path, err)
+	}
+
+	// Full-parse only the last role line for the current session.
+	if parseLastMsg && lastRoleBytes != nil {
+		var fullRec rawRecord
+		if err := json.Unmarshal(lastRoleBytes, &fullRec); err == nil {
+			msg := buildMessage(&fullRec)
+			if msg.Role != "" {
+				meta.LastMessage = msg
+			}
+		}
+	}
+
+	return meta, nil
+}
+
 // --------------------------------------------------------------------------
 // Parsing entry points
 // --------------------------------------------------------------------------

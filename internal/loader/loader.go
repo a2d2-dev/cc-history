@@ -190,6 +190,29 @@ func FindSessionByID(root, id string) (string, error) {
 	return "", fmt.Errorf("session not found: %s", id)
 }
 
+// LoadAllSessionsMeta scans every JSONL file under root using lightweight
+// metadata-only parsing (no content allocation). The session whose path equals
+// currentFilePath gets its LastMessage populated. Results are sorted by
+// StartTime (oldest first). Files that fail to scan are silently skipped.
+func LoadAllSessionsMeta(root, currentFilePath string) ([]*parser.SessionMeta, error) {
+	paths, err := ScanJSONL(root)
+	if err != nil {
+		return nil, err
+	}
+	metas := make([]*parser.SessionMeta, 0, len(paths))
+	for _, p := range paths {
+		m, err := parser.ParseFileMeta(p, p == currentFilePath)
+		if err != nil {
+			continue
+		}
+		metas = append(metas, m)
+	}
+	sort.Slice(metas, func(i, j int) bool {
+		return metas[i].StartTime.Before(metas[j].StartTime)
+	})
+	return metas, nil
+}
+
 // LoadAllSessions parses every JSONL file under root and returns all sessions
 // sorted by their earliest message timestamp (oldest first).
 // Files that cannot be parsed are silently skipped.

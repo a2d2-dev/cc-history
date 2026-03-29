@@ -104,13 +104,13 @@ func main() {
 	}
 
 	if *listFlag {
-		sessions, err := loader.LoadAllSessions(root)
+		currentPath, _, _ := loader.FindCurrentSession(root)
+		metas, err := loader.LoadAllSessionsMeta(root, currentPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		currentPath, _, _ := loader.FindCurrentSession(root)
-		display.ListSessions(os.Stdout, sessions, currentPath)
+		display.ListSessions(os.Stdout, metas, currentPath)
 		return
 	}
 

@@ -184,6 +184,33 @@ func TestFilterAllSessions_NoSep(t *testing.T) {
 	}
 }
 
+// sessionToMeta converts a *parser.Session to *parser.SessionMeta for testing.
+// lastMsgFilePath is the FilePath of the session that should have its last
+// message populated (simulates the current session).
+func sessionToMeta(s *parser.Session, lastMsgFilePath string) *parser.SessionMeta {
+	meta := &parser.SessionMeta{
+		ID:       s.ID,
+		FilePath: s.FilePath,
+	}
+	var lastMsg *parser.Message
+	for _, m := range s.Messages {
+		if m.Role == "" {
+			continue
+		}
+		if meta.StartTime.IsZero() || m.Timestamp.Before(meta.StartTime) {
+			meta.StartTime = m.Timestamp
+		}
+		if m.Timestamp.After(meta.EndTime) {
+			meta.EndTime = m.Timestamp
+			lastMsg = m
+		}
+	}
+	if s.FilePath == lastMsgFilePath && lastMsg != nil {
+		meta.LastMessage = lastMsg
+	}
+	return meta
+}
+
 func TestListSessions_AllSessionsListed(t *testing.T) {
 	t1 := ts("2024-01-01T10:00:00Z")
 	t2 := ts("2024-01-01T11:00:00Z")
@@ -191,8 +218,9 @@ func TestListSessions_AllSessionsListed(t *testing.T) {
 	s1 := makeSession("sessA", "/proj/a", []*parser.Message{userMsg("msg A", t1)})
 	s2 := makeSession("sessB", "/proj/b", []*parser.Message{asstMsg("msg B", t2)})
 
+	metas := []*parser.SessionMeta{sessionToMeta(s1, ""), sessionToMeta(s2, "")}
 	var b strings.Builder
-	display.ListSessions(&b, []*parser.Session{s1, s2}, "")
+	display.ListSessions(&b, metas, "")
 	out := b.String()
 
 	if !strings.Contains(out, "sessA") {
@@ -211,8 +239,9 @@ func TestListSessions_CurrentMarked(t *testing.T) {
 		asstMsg("last reply", ts("2024-01-01T10:05:00Z")),
 	})
 
+	metas := []*parser.SessionMeta{sessionToMeta(s, "curr.jsonl")}
 	var b strings.Builder
-	display.ListSessions(&b, []*parser.Session{s}, "curr.jsonl")
+	display.ListSessions(&b, metas, "curr.jsonl")
 	out := b.String()
 
 	if !strings.Contains(out, "►") {
@@ -229,8 +258,9 @@ func TestListSessions_CurrentShowsLastMessage(t *testing.T) {
 		asstMsg("the final answer", t2),
 	})
 
+	metas := []*parser.SessionMeta{sessionToMeta(s, "curr.jsonl")}
 	var b strings.Builder
-	display.ListSessions(&b, []*parser.Session{s}, "curr.jsonl")
+	display.ListSessions(&b, metas, "curr.jsonl")
 	out := b.String()
 
 	if !strings.Contains(out, "the final answer") {
@@ -244,13 +274,14 @@ func TestListSessions_NonCurrentNoLastMessage(t *testing.T) {
 	s1 := makeSession("sessA", "/a", []*parser.Message{asstMsg("other session msg", t1)})
 	s2 := makeSession("current", "/b", []*parser.Message{asstMsg("current msg", ts("2024-01-01T11:00:00Z"))})
 
+	metas := []*parser.SessionMeta{
+		sessionToMeta(s1, "current.jsonl"),
+		sessionToMeta(s2, "current.jsonl"),
+	}
 	var b strings.Builder
-	display.ListSessions(&b, []*parser.Session{s1, s2}, "current.jsonl")
+	display.ListSessions(&b, metas, "current.jsonl")
 	out := b.String()
 
-	// "other session msg" should NOT appear as an indented last-message line.
-	// It will appear as part of the session summary line (no), actually no —
-	// only the current session gets the last-message line.
 	lines := strings.Split(out, "\n")
 	for _, line := range lines {
 		if strings.HasPrefix(line, "    ") && strings.Contains(line, "other session msg") {
@@ -266,8 +297,10 @@ func TestListSessions_ChronologicalOrder(t *testing.T) {
 	sLate := makeSession("late", "/b", []*parser.Message{userMsg("late msg", t2)})
 	sEarly := makeSession("early", "/a", []*parser.Message{userMsg("early msg", t1)})
 
+	// Pre-sort to match expected behaviour (ListSessions expects pre-sorted).
+	metas := []*parser.SessionMeta{sessionToMeta(sEarly, ""), sessionToMeta(sLate, "")}
 	var b strings.Builder
-	display.ListSessions(&b, []*parser.Session{sLate, sEarly}, "")
+	display.ListSessions(&b, metas, "")
 	out := b.String()
 
 	posEarly := strings.Index(out, "early")

@@ -5,7 +5,6 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/a2d2-dev/cc-history/internal/parser"
 )
@@ -71,50 +70,25 @@ func PrintAllSessions(w io.Writer, sessions []*parser.Session, noSep bool) {
 	}
 }
 
-// ListSessions writes a compact one-line summary per session to w, sorted
-// chronologically (oldest first). The session whose FilePath equals
-// currentFilePath is marked with "►" and followed by its last message.
-// If currentFilePath is empty, no session is highlighted.
-func ListSessions(w io.Writer, sessions []*parser.Session, currentFilePath string) {
-	// Sort sessions by their first message timestamp.
-	sorted := make([]*parser.Session, len(sessions))
-	copy(sorted, sessions)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		return sessionFirstTime(sorted[i]).Before(sessionFirstTime(sorted[j]))
-	})
+// ListSessions writes a compact one-line summary per session meta to w.
+// Sessions are expected to be pre-sorted by StartTime (oldest first).
+// The session whose FilePath equals currentFilePath is marked with "►" and
+// followed by its LastMessage (if populated).
+func ListSessions(w io.Writer, metas []*parser.SessionMeta, currentFilePath string) {
+	for _, m := range metas {
+		isCurrent := m.FilePath == currentFilePath
 
-	for _, s := range sorted {
-		isCurrent := s.FilePath == currentFilePath
-
-		// Compute time range and message count.
-		var first, last time.Time
-		count := 0
-		var lastMsg *parser.Message
-		for _, m := range s.Messages {
-			if m.Role == "" {
-				continue
-			}
-			count++
-			if first.IsZero() || m.Timestamp.Before(first) {
-				first = m.Timestamp
-			}
-			if m.Timestamp.After(last) {
-				last = m.Timestamp
-				lastMsg = m
-			}
-		}
-
-		idStr := s.ID
+		idStr := m.ID
 		if len(idStr) > 8 {
 			idStr = idStr[:8]
 		}
 
 		var timeRange string
-		if !first.IsZero() {
-			if first.Format("2006-01-02") == last.Format("2006-01-02") {
-				timeRange = first.Format("2006-01-02 15:04") + " – " + last.Format("15:04")
+		if !m.StartTime.IsZero() {
+			if m.StartTime.Format("2006-01-02") == m.EndTime.Format("2006-01-02") {
+				timeRange = m.StartTime.Format("2006-01-02 15:04") + " – " + m.EndTime.Format("15:04")
 			} else {
-				timeRange = first.Format("2006-01-02 15:04") + " – " + last.Format("2006-01-02 15:04")
+				timeRange = m.StartTime.Format("2006-01-02 15:04") + " – " + m.EndTime.Format("2006-01-02 15:04")
 			}
 		}
 
@@ -123,22 +97,22 @@ func ListSessions(w io.Writer, sessions []*parser.Session, currentFilePath strin
 			marker = colorize(colorCyan, "► ")
 		}
 
-		fmt.Fprintf(w, "%s%-8s  %s  %d msgs  %s\n",
-			marker, idStr, s.FilePath, count, timeRange)
+		fmt.Fprintf(w, "%s%-8s  %s  %s\n", marker, idStr, m.FilePath, timeRange)
 
 		// For the current session, print its last message indented.
-		if isCurrent && lastMsg != nil {
-			ts := lastMsg.Timestamp.Format("15:04:05")
-			role := formatRole(lastMsg.Role)
+		if isCurrent && m.LastMessage != nil {
+			msg := m.LastMessage
+			ts := msg.Timestamp.Format("15:04:05")
+			role := formatRole(msg.Role)
 			var content string
 			switch {
-			case strings.TrimSpace(lastMsg.Text) != "":
-				content = truncate(strings.TrimSpace(lastMsg.Text), summaryMaxRunes)
-			case len(lastMsg.ToolCalls) > 0:
-				tc := lastMsg.ToolCalls[len(lastMsg.ToolCalls)-1]
+			case strings.TrimSpace(msg.Text) != "":
+				content = truncate(strings.TrimSpace(msg.Text), summaryMaxRunes)
+			case len(msg.ToolCalls) > 0:
+				tc := msg.ToolCalls[len(msg.ToolCalls)-1]
 				content = fmt.Sprintf("[%s %s]", tc.Name, formatArgs(tc.Arguments))
-			case len(lastMsg.ToolResults) > 0:
-				tr := lastMsg.ToolResults[0]
+			case len(msg.ToolResults) > 0:
+				tr := msg.ToolResults[0]
 				if tr.IsError {
 					name := tr.ToolName
 					if name == "" {
@@ -152,16 +126,6 @@ func ListSessions(w io.Writer, sessions []*parser.Session, currentFilePath strin
 			}
 		}
 	}
-}
-
-// sessionFirstTime returns the timestamp of the first message with a role in s.
-func sessionFirstTime(s *parser.Session) time.Time {
-	for _, m := range s.Messages {
-		if m.Role != "" && !m.Timestamp.IsZero() {
-			return m.Timestamp
-		}
-	}
-	return time.Time{}
 }
 
 // FilterAllSessions writes messages from all sessions that match pattern,
