@@ -59,20 +59,30 @@ func main() {
 	pattern := flag.Arg(0)
 
 	if *tuiFlag || *interactiveFlag {
-		sessionPath, isFallback, err := loader.FindCurrentSession(root)
+		sessions, err := loader.LoadAllSessions(root)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
+		}
+		if len(sessions) == 0 {
+			fmt.Fprintf(os.Stderr, "error: no sessions found in %s\n", root)
+			os.Exit(1)
+		}
+		// Find current session index.
+		currentIdx := len(sessions) - 1 // default: last (most recent)
+		sessionPath, isFallback, err := loader.FindCurrentSession(root)
+		if err == nil {
+			for i, s := range sessions {
+				if s.FilePath == sessionPath {
+					currentIdx = i
+					break
+				}
+			}
 		}
 		if isFallback {
 			fmt.Fprintf(os.Stderr, "note: CLAUDE_SESSION_ID not set — opening most recent session\n")
 		}
-		session, err := parser.ParseFile(sessionPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := tui.RunSession(session); err != nil {
+		if err := tui.RunTUI(sessions, currentIdx); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}

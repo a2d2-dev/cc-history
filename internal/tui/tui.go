@@ -4,6 +4,7 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -25,6 +26,21 @@ var (
 	styleHeader    = lipgloss.NewStyle().Bold(true)
 	styleBorder    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleMatch     = lipgloss.NewStyle().Background(lipgloss.Color("3")).Foreground(lipgloss.Color("0"))  // yellow bg
+	stylePickSel   = lipgloss.NewStyle().Background(lipgloss.Color("4")).Foreground(lipgloss.Color("15")) // blue bg
+	stylePickBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+)
+
+// --------------------------------------------------------------------------
+// Mode
+// --------------------------------------------------------------------------
+
+type tuiMode int
+
+const (
+	modeNormal tuiMode = iota
+	modePicker         // session list overlay
+	modeSearch         // inline search
 )
 
 // --------------------------------------------------------------------------
@@ -33,44 +49,82 @@ var (
 
 // item represents a single rendered line (or block) in the viewport.
 type item struct {
-	text      string // rendered line text
+	text      string // rendered line text (may contain ANSI)
+	plain     string // stripped version for search matching
 	msgIndex  int    // which message this item belongs to (-1 = separator/meta)
 	toolIndex int    // which tool call within that message (-1 = not a tool line)
 }
 
 // model is the bubbletea model for the TUI.
 type model struct {
-	session     *parser.Session
-	items       []item
-	expanded    map[int]bool // msgIndex -> expanded (tool calls)
-	cursor      int          // viewport top line index
-	height      int          // terminal height
-	width       int          // terminal width
-	showHelp    bool
-	totalLines  int
+	sessions   []*parser.Session
+	sessionIdx int
+	items      []item
+	expanded   map[int]bool // msgIndex -> expanded (tool calls)
+	cursor     int          // viewport top line index
+	height     int          // terminal height
+	width      int          // terminal width
+	showHelp   bool
+	totalLines int
+
+	// search
+	mode        tuiMode
+	searchQuery string
+	matches     []int // item indices that match the search query
+	matchCursor int   // current position in matches
+
+	// session picker
+	pickCursor int
+}
+
+// session returns the currently active session.
+func (m model) session() *parser.Session {
+	if len(m.sessions) == 0 {
+		return nil
+	}
+	return m.sessions[m.sessionIdx]
 }
 
 // --------------------------------------------------------------------------
 // Launch
 // --------------------------------------------------------------------------
 
-// RunSession starts the TUI for a single session and blocks until the user quits.
-func RunSession(session *parser.Session) error {
-	m := newModel(session)
+// RunTUI starts the TUI with a list of sessions, opening the one at currentIdx.
+// It blocks until the user quits.
+func RunTUI(sessions []*parser.Session, currentIdx int) error {
+	if len(sessions) == 0 {
+		return fmt.Errorf("no sessions to display")
+	}
+	if currentIdx < 0 || currentIdx >= len(sessions) {
+		currentIdx = 0
+	}
+	m := newModelMulti(sessions, currentIdx)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
 
-func newModel(session *parser.Session) model {
+// RunSession starts the TUI for a single session and blocks until the user quits.
+// Kept for backward compatibility.
+func RunSession(session *parser.Session) error {
+	return RunTUI([]*parser.Session{session}, 0)
+}
+
+func newModelMulti(sessions []*parser.Session, idx int) model {
 	m := model{
-		session:  session,
-		expanded: make(map[int]bool),
-		height:   24,
-		width:    80,
+		sessions:   sessions,
+		sessionIdx: idx,
+		expanded:   make(map[int]bool),
+		height:     24,
+		width:      80,
 	}
 	m.rebuildItems()
 	return m
+}
+
+// newModel creates a model from a single session (used by tests).
+func newModel(session *parser.Session) model {
+	return newModelMulti([]*parser.Session{session}, 0)
 }
 
 // --------------------------------------------------------------------------
@@ -91,58 +145,203 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "Q", "ctrl+c":
-			return m, tea.Quit
+		switch m.mode {
+		case modePicker:
+			return m.updatePicker(msg)
+		case modeSearch:
+			return m.updateSearch(msg)
+		default:
+			return m.updateNormal(msg)
+		}
+	}
+	return m, nil
+}
 
-		case "?":
-			m.showHelp = !m.showHelp
+func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "Q", "ctrl+c":
+		return m, tea.Quit
 
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
+	case "?":
+		m.showHelp = !m.showHelp
 
-		case "down", "j":
-			maxTop := m.maxCursor()
-			if m.cursor < maxTop {
-				m.cursor++
-			}
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
 
-		case "pgup", "b", "ctrl+u":
-			m.cursor -= m.viewHeight()
-			if m.cursor < 0 {
-				m.cursor = 0
-			}
+	case "down", "j":
+		maxTop := m.maxCursor()
+		if m.cursor < maxTop {
+			m.cursor++
+		}
 
-		case "pgdown", "f", "ctrl+d":
-			m.cursor += m.viewHeight()
-			m.clampCursor()
-
-		case "home", "g":
+	case "pgup", "b", "ctrl+u":
+		m.cursor -= m.viewHeight()
+		if m.cursor < 0 {
 			m.cursor = 0
+		}
 
-		case "end", "G":
-			m.cursor = m.maxCursor()
+	case "pgdown", "f", "ctrl+d":
+		m.cursor += m.viewHeight()
+		m.clampCursor()
 
-		case "t", "T":
-			// Toggle tool calls for the message at the visible center of view.
-			msgIdx := m.focusedMsgIndex()
-			if msgIdx >= 0 {
-				m.expanded[msgIdx] = !m.expanded[msgIdx]
-				m.rebuildItems()
-				m.clampCursor()
+	case "home", "g":
+		m.cursor = 0
+
+	case "end", "G":
+		m.cursor = m.maxCursor()
+
+	case "t", "T":
+		msgIdx := m.focusedMsgIndex()
+		if msgIdx >= 0 {
+			m.expanded[msgIdx] = !m.expanded[msgIdx]
+			m.rebuildItems()
+			m.clampCursor()
+		}
+
+	case "s":
+		if len(m.sessions) > 1 {
+			m.mode = modePicker
+			m.pickCursor = m.sessionIdx
+			m.showHelp = false
+		}
+
+	case "/":
+		m.mode = modeSearch
+		m.searchQuery = ""
+		m.matches = nil
+		m.matchCursor = 0
+		m.showHelp = false
+
+	case "n":
+		if len(m.matches) > 0 {
+			m.matchCursor = (m.matchCursor + 1) % len(m.matches)
+			m.scrollToMatch()
+		}
+
+	case "N":
+		if len(m.matches) > 0 {
+			m.matchCursor = (m.matchCursor - 1 + len(m.matches)) % len(m.matches)
+			m.scrollToMatch()
+		}
+	}
+	return m, nil
+}
+
+func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc", "q":
+		m.mode = modeNormal
+
+	case "up", "k":
+		if m.pickCursor > 0 {
+			m.pickCursor--
+		}
+
+	case "down", "j":
+		if m.pickCursor < len(m.sessions)-1 {
+			m.pickCursor++
+		}
+
+	case "enter":
+		if m.pickCursor != m.sessionIdx {
+			m.sessionIdx = m.pickCursor
+			m.expanded = make(map[int]bool)
+			m.cursor = 0
+			m.searchQuery = ""
+			m.matches = nil
+			m.matchCursor = 0
+			m.rebuildItems()
+		}
+		m.mode = modeNormal
+	}
+	return m, nil
+}
+
+func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc":
+		m.mode = modeNormal
+		m.searchQuery = ""
+		m.matches = nil
+		m.matchCursor = 0
+
+	case "enter":
+		// Confirm search, stay in search mode but allow n/N navigation.
+		m.mode = modeNormal
+
+	case "backspace", "ctrl+h":
+		if len(m.searchQuery) > 0 {
+			runes := []rune(m.searchQuery)
+			m.searchQuery = string(runes[:len(runes)-1])
+			m.recomputeMatches()
+		}
+
+	default:
+		if len(msg.Runes) > 0 {
+			m.searchQuery += string(msg.Runes)
+			m.recomputeMatches()
+			if len(m.matches) > 0 {
+				m.matchCursor = 0
+				m.scrollToMatch()
 			}
 		}
 	}
 	return m, nil
 }
 
-func (m model) View() string {
-	if m.showHelp {
-		return m.helpView()
+// recomputeMatches finds all items matching the current searchQuery.
+func (m *model) recomputeMatches() {
+	m.matches = nil
+	if m.searchQuery == "" {
+		m.matchCursor = 0
+		return
 	}
-	return m.mainView()
+	q := strings.ToLower(m.searchQuery)
+	for i, it := range m.items {
+		if strings.Contains(strings.ToLower(it.plain), q) {
+			m.matches = append(m.matches, i)
+		}
+	}
+	if m.matchCursor >= len(m.matches) {
+		m.matchCursor = 0
+	}
+}
+
+// scrollToMatch sets cursor so the current match is visible.
+func (m *model) scrollToMatch() {
+	if len(m.matches) == 0 {
+		return
+	}
+	idx := m.matches[m.matchCursor]
+	// If idx is outside the current viewport, scroll to center it.
+	vh := m.viewHeight()
+	if idx < m.cursor || idx >= m.cursor+vh {
+		m.cursor = idx - vh/2
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		m.clampCursor()
+	}
+}
+
+func (m model) View() string {
+	switch m.mode {
+	case modePicker:
+		return m.pickerView()
+	default:
+		if m.showHelp {
+			return m.helpView()
+		}
+		return m.mainView()
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -157,8 +356,24 @@ func (m model) mainView() string {
 	if end > len(m.items) {
 		end = len(m.items)
 	}
-	for _, it := range m.items[m.cursor:end] {
-		lines = append(lines, it.text)
+
+	currentMatch := -1
+	if len(m.matches) > 0 && m.matchCursor < len(m.matches) {
+		currentMatch = m.matches[m.matchCursor]
+	}
+
+	for i, it := range m.items[m.cursor:end] {
+		absIdx := m.cursor + i
+		line := it.text
+		// Highlight matched lines.
+		if m.searchQuery != "" && strings.Contains(strings.ToLower(it.plain), strings.ToLower(m.searchQuery)) {
+			if absIdx == currentMatch {
+				line = styleMatch.Render(it.plain)
+			} else {
+				line = styleDim.Render(it.plain)
+			}
+		}
+		lines = append(lines, line)
 	}
 
 	// Pad to fill terminal.
@@ -178,13 +393,103 @@ func (m model) statusBar() string {
 			pct = 100
 		}
 	}
-	hint := styleHelp.Render("↑↓/jk scroll · t toggle tools · ? help · q quit")
+
+	var hint string
+	if m.mode == modeSearch {
+		matchInfo := ""
+		if m.searchQuery != "" {
+			matchInfo = fmt.Sprintf(" [%d matches]", len(m.matches))
+		}
+		hint = styleHelp.Render(fmt.Sprintf("search: %s%s  ESC cancel · Enter confirm · n/N jump", m.searchQuery, matchInfo))
+	} else if m.searchQuery != "" {
+		hint = styleHelp.Render(fmt.Sprintf("/%s  [%d/%d]  n next · N prev · / new search", m.searchQuery, m.matchCursor+1, len(m.matches)))
+	} else {
+		sessionInfo := ""
+		if len(m.sessions) > 1 {
+			sessionInfo = fmt.Sprintf(" s sessions(%d)", len(m.sessions))
+		}
+		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · t toggle tools · / search%s · ? help · q quit", sessionInfo))
+	}
+
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", pct))
 	gap := m.width - lipgloss.Width(hint) - lipgloss.Width(pos)
 	if gap < 0 {
 		gap = 0
 	}
 	return hint + strings.Repeat(" ", gap) + pos
+}
+
+func (m model) pickerView() string {
+	sess := m.sessions
+	vh := m.viewHeight()
+
+	// Build picker lines.
+	lines := make([]string, 0, len(sess)+4)
+	title := styleHeader.Render(fmt.Sprintf("Sessions (%d)  ↑↓/jk navigate · Enter switch · Esc cancel", len(sess)))
+	lines = append(lines, title)
+	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 60))))
+	lines = append(lines, "")
+
+	// Visible window for the list.
+	visStart := 0
+	if m.pickCursor >= vh-4 {
+		visStart = m.pickCursor - (vh - 5)
+	}
+	if visStart < 0 {
+		visStart = 0
+	}
+
+	for i := visStart; i < len(sess) && i < visStart+(vh-4); i++ {
+		s := sess[i]
+		ts := sessionLabel(s)
+		label := fmt.Sprintf("  %2d  %s", i+1, ts)
+		if i == m.sessionIdx {
+			label = fmt.Sprintf("  %2d  %s  ←current", i+1, ts)
+		}
+		if i == m.pickCursor {
+			lines = append(lines, stylePickSel.Render(label))
+		} else {
+			lines = append(lines, label)
+		}
+	}
+
+	// Pad.
+	for len(lines) < vh {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines[:vh], "\n") + "\n" + styleHelp.Render("press Esc to cancel")
+}
+
+func sessionLabel(s *parser.Session) string {
+	id := s.ID
+	if len(id) > 16 {
+		id = id[:16]
+	}
+	// Find first user message for preview.
+	preview := ""
+	ts := ""
+	for _, msg := range s.Messages {
+		if !msg.Timestamp.IsZero() && ts == "" {
+			ts = msg.Timestamp.Format("2006-01-02 15:04")
+		}
+		if msg.Role == "user" && preview == "" {
+			preview = strings.TrimSpace(msg.Text)
+			if len(preview) > 50 {
+				preview = preview[:50] + "…"
+			}
+		}
+		if ts != "" && preview != "" {
+			break
+		}
+	}
+	if ts == "" {
+		ts = "unknown"
+	}
+	if preview == "" {
+		preview = id
+	}
+	return fmt.Sprintf("[%s]  %s", ts, preview)
 }
 
 func (m model) helpView() string {
@@ -199,6 +504,9 @@ func (m model) helpView() string {
 		"  g / Home     go to top",
 		"  G / End      go to bottom",
 		"  t            toggle tool calls for focused message",
+		"  s            open session switcher",
+		"  /            enter search mode",
+		"  n / N        next / previous search match",
 		"  ?            toggle this help",
 		"  q            quit",
 	}
@@ -217,13 +525,22 @@ func (m model) helpView() string {
 
 func (m *model) rebuildItems() {
 	m.items = nil
-	for i, msg := range m.session.Messages {
+	sess := m.session()
+	if sess == nil {
+		m.totalLines = 0
+		return
+	}
+	for i, msg := range sess.Messages {
 		if msg.Role == "" {
 			continue
 		}
 		m.items = append(m.items, m.renderMessage(i, msg)...)
 	}
 	m.totalLines = len(m.items)
+	// Recompute matches if search is active.
+	if m.searchQuery != "" {
+		m.recomputeMatches()
+	}
 }
 
 func (m *model) renderMessage(idx int, msg *parser.Message) []item {
@@ -234,19 +551,32 @@ func (m *model) renderMessage(idx int, msg *parser.Message) []item {
 
 	// Header line.
 	header := fmt.Sprintf("[%s]  %s", styleDim.Render(ts), roleStyle.Render(role))
+	headerPlain := fmt.Sprintf("[%s]  %s", ts, role)
 
 	// Text content.
 	if text := strings.TrimSpace(msg.Text); text != "" {
 		wrapped := wordWrap(text, m.width-12) // leave room for indent
 		for j, line := range strings.Split(wrapped, "\n") {
 			prefix := "        "
+			prefixPlain := "        "
 			if j == 0 {
 				prefix = header + "  "
+				prefixPlain = headerPlain + "  "
 			}
-			items = append(items, item{text: prefix + line, msgIndex: idx, toolIndex: -1})
+			items = append(items, item{
+				text:      prefix + line,
+				plain:     prefixPlain + line,
+				msgIndex:  idx,
+				toolIndex: -1,
+			})
 		}
 	} else {
-		items = append(items, item{text: header, msgIndex: idx, toolIndex: -1})
+		items = append(items, item{
+			text:      header,
+			plain:     headerPlain,
+			msgIndex:  idx,
+			toolIndex: -1,
+		})
 	}
 
 	// Tool calls.
@@ -269,8 +599,9 @@ func (m *model) renderToolCall(msgIdx, toolIdx int, tc *parser.ToolCall) []item 
 	if expanded {
 		foldStyle = styleTool
 	}
-	summary := foldStyle.Render(fmt.Sprintf("  %s [tool] %s %s", sym, tc.Name, shortArgs(tc.Arguments)))
-	items := []item{{text: summary, msgIndex: msgIdx, toolIndex: toolIdx}}
+	summaryPlain := fmt.Sprintf("  %s [tool] %s %s", sym, tc.Name, shortArgs(tc.Arguments))
+	summary := foldStyle.Render(summaryPlain)
+	items := []item{{text: summary, plain: summaryPlain, msgIndex: msgIdx, toolIndex: toolIdx}}
 
 	if !expanded {
 		return items
@@ -282,6 +613,7 @@ func (m *model) renderToolCall(msgIdx, toolIdx int, tc *parser.ToolCall) []item 
 		for _, line := range strings.Split(pretty, "\n") {
 			items = append(items, item{
 				text:      styleTool.Render("     │ ") + line,
+				plain:     "     │ " + line,
 				msgIndex:  msgIdx,
 				toolIndex: toolIdx,
 			})
@@ -291,14 +623,18 @@ func (m *model) renderToolCall(msgIdx, toolIdx int, tc *parser.ToolCall) []item 
 	// Expanded: show result.
 	if tc.Result != "" {
 		label := styleToolFold.Render("  result: ")
+		labelPlain := "  result: "
 		wrapped := wordWrap(tc.Result, m.width-14)
 		for j, line := range strings.Split(wrapped, "\n") {
 			prefix := "           "
+			prefixPlain := "           "
 			if j == 0 {
 				prefix = label
+				prefixPlain = labelPlain
 			}
 			items = append(items, item{
 				text:      prefix + line,
+				plain:     prefixPlain + line,
 				msgIndex:  msgIdx,
 				toolIndex: toolIdx,
 			})
@@ -396,6 +732,14 @@ func wordWrap(s string, maxWidth int) string {
 	return strings.TrimRight(result, "\n")
 }
 
+// ansiEscape matches ANSI escape sequences for stripping.
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// stripANSI removes ANSI color codes from a string.
+func stripANSI(s string) string {
+	return ansiEscape.ReplaceAllString(s, "")
+}
+
 func (m model) viewHeight() int {
 	h := m.height - 1 // reserve status bar
 	if h < 1 {
@@ -433,4 +777,11 @@ func (m model) focusedMsgIndex() int {
 		return -1
 	}
 	return m.items[mid].msgIndex
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
