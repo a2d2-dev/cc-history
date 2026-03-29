@@ -4,7 +4,9 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -44,6 +46,27 @@ const (
 )
 
 // --------------------------------------------------------------------------
+// Grouped-view types
+// --------------------------------------------------------------------------
+
+// rowKind distinguishes group headers from individual session rows in the
+// grouped session list.
+type rowKind int
+
+const (
+	rowKindGroup   rowKind = iota // collapsible CWD group header
+	rowKindSession                // individual session entry within a group
+)
+
+// displayRow is one rendered entry in the grouped session list.
+type displayRow struct {
+	kind       rowKind
+	cwd        string // abbreviated group path (both types)
+	sessionIdx int    // index into model.sessions; -1 for group rows
+	count      int    // for group rows: number of sessions in group
+}
+
+// --------------------------------------------------------------------------
 // Model
 // --------------------------------------------------------------------------
 
@@ -73,8 +96,14 @@ type model struct {
 	matches     []int // item indices that match the search query
 	matchCursor int   // current position in matches
 
-	// session picker
+	// session picker (flat list)
 	pickCursor int
+
+	// grouped session list
+	groupedPicker  bool            // true = show grouped picker, false = flat picker
+	expandedGroups map[string]bool // cwd -> expanded; persists for the session
+	groupRows      []displayRow    // computed rows for grouped view (rebuilt on toggle)
+	groupPickCursor int            // cursor position in groupRows
 }
 
 // session returns the currently active session.
@@ -112,11 +141,12 @@ func RunSession(session *parser.Session) error {
 
 func newModelMulti(sessions []*parser.Session, idx int) model {
 	m := model{
-		sessions:   sessions,
-		sessionIdx: idx,
-		expanded:   make(map[int]bool),
-		height:     24,
-		width:      80,
+		sessions:       sessions,
+		sessionIdx:     idx,
+		expanded:       make(map[int]bool),
+		expandedGroups: make(map[string]bool),
+		height:         24,
+		width:          80,
 	}
 	m.rebuildItems()
 	return m
@@ -203,7 +233,16 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		if len(m.sessions) > 1 {
 			m.mode = modePicker
+			m.groupedPicker = false
 			m.pickCursor = m.sessionIdx
+			m.showHelp = false
+		}
+
+	case "tab":
+		if len(m.sessions) > 1 {
+			m.mode = modePicker
+			m.groupedPicker = true
+			m.buildGroupRows()
 			m.showHelp = false
 		}
 
@@ -230,12 +269,20 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.groupedPicker {
+		return m.updateGroupedPicker(msg)
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
 
 	case "esc", "q":
 		m.mode = modeNormal
+
+	case "tab":
+		m.groupedPicker = true
+		m.buildGroupRows()
 
 	case "up", "k":
 		if m.pickCursor > 0 {
@@ -258,6 +305,62 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildItems()
 		}
 		m.mode = modeNormal
+	}
+	return m, nil
+}
+
+func (m model) updateGroupedPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc", "q":
+		m.mode = modeNormal
+
+	case "tab":
+		m.groupedPicker = false
+		m.pickCursor = m.sessionIdx
+
+	case "up", "k":
+		if m.groupPickCursor > 0 {
+			m.groupPickCursor--
+		}
+
+	case "down", "j":
+		if m.groupPickCursor < len(m.groupRows)-1 {
+			m.groupPickCursor++
+		}
+
+	case "left", "right", "enter":
+		if len(m.groupRows) == 0 {
+			break
+		}
+		row := m.groupRows[m.groupPickCursor]
+		switch row.kind {
+		case rowKindGroup:
+			// Expand or collapse the group.
+			m.expandedGroups[row.cwd] = !m.expandedGroups[row.cwd]
+			m.buildGroupRows()
+			// Keep cursor on the same group after rebuild.
+			for i, r := range m.groupRows {
+				if r.kind == rowKindGroup && r.cwd == row.cwd {
+					m.groupPickCursor = i
+					break
+				}
+			}
+		case rowKindSession:
+			// Select this session and return to message view.
+			if row.sessionIdx != m.sessionIdx {
+				m.sessionIdx = row.sessionIdx
+				m.expanded = make(map[int]bool)
+				m.cursor = 0
+				m.searchQuery = ""
+				m.matches = nil
+				m.matchCursor = 0
+				m.rebuildItems()
+			}
+			m.mode = modeNormal
+		}
 	}
 	return m, nil
 }
@@ -335,6 +438,9 @@ func (m *model) scrollToMatch() {
 func (m model) View() string {
 	switch m.mode {
 	case modePicker:
+		if m.groupedPicker {
+			return m.groupedPickerView()
+		}
 		return m.pickerView()
 	default:
 		if m.showHelp {
@@ -406,7 +512,7 @@ func (m model) statusBar() string {
 	} else {
 		sessionInfo := ""
 		if len(m.sessions) > 1 {
-			sessionInfo = fmt.Sprintf(" s sessions(%d)", len(m.sessions))
+			sessionInfo = fmt.Sprintf(" s list · Tab grouped(%d)", len(m.sessions))
 		}
 		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · t toggle tools · / search%s · ? help · q quit", sessionInfo))
 	}
@@ -504,11 +610,18 @@ func (m model) helpView() string {
 		"  g / Home     go to top",
 		"  G / End      go to bottom",
 		"  t            toggle tool calls for focused message",
-		"  s            open session switcher",
+		"  s            open flat session list",
+		"  Tab          open grouped session list (by directory)",
 		"  /            enter search mode",
 		"  n / N        next / previous search match",
 		"  ?            toggle this help",
 		"  q            quit",
+		"",
+		styleDim.Render("  In session list:"),
+		styleDim.Render("  Tab           toggle flat / grouped view"),
+		styleDim.Render("  ←/→/Enter     expand / collapse group (grouped view)"),
+		styleDim.Render("  Enter         select session"),
+		styleDim.Render("  Esc / q       close list"),
 	}
 	body := strings.Join(lines, "\n")
 	vh := m.viewHeight()
@@ -778,6 +891,205 @@ func (m model) focusedMsgIndex() int {
 	}
 	return m.items[mid].msgIndex
 }
+
+// --------------------------------------------------------------------------
+// Grouped session list helpers
+// --------------------------------------------------------------------------
+
+// sessionCWD returns the first non-empty CWD found in a session's messages.
+func sessionCWD(s *parser.Session) string {
+	for _, msg := range s.Messages {
+		if msg.CWD != "" {
+			return msg.CWD
+		}
+	}
+	return ""
+}
+
+// abbrevPath replaces the home directory prefix with "~".
+func abbrevPath(p string) string {
+	if p == "" {
+		return "(unknown)"
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" && strings.HasPrefix(p, home) {
+		return "~" + p[len(home):]
+	}
+	return p
+}
+
+// buildGroupRows rebuilds m.groupRows from m.sessions grouped by CWD.
+// Stable insertion order is preserved.
+func (m *model) buildGroupRows() {
+	type groupEntry struct {
+		cwd          string
+		sessionIdxs  []int
+		newestTs     string
+		newestPreview string
+	}
+
+	var order []string
+	groups := map[string]*groupEntry{}
+
+	for i, s := range m.sessions {
+		cwd := abbrevPath(sessionCWD(s))
+		if _, ok := groups[cwd]; !ok {
+			order = append(order, cwd)
+			groups[cwd] = &groupEntry{cwd: cwd}
+		}
+		g := groups[cwd]
+		g.sessionIdxs = append(g.sessionIdxs, i)
+	}
+
+	// Sort groups alphabetically for deterministic display.
+	sort.Strings(order)
+
+	// Collect newest timestamp + preview for each group.
+	for _, cwd := range order {
+		g := groups[cwd]
+		var newestTs string
+		var newestPreview string
+		for _, idx := range g.sessionIdxs {
+			s := m.sessions[idx]
+			for _, msg := range s.Messages {
+				if !msg.Timestamp.IsZero() {
+					ts := msg.Timestamp.Format("2006-01-02 15:04")
+					if ts > newestTs {
+						newestTs = ts
+					}
+				}
+				if msg.Role == "user" && msg.Text != "" && newestPreview == "" {
+					p := strings.TrimSpace(msg.Text)
+					if len([]rune(p)) > 50 {
+						p = string([]rune(p)[:50]) + "…"
+					}
+					newestPreview = p
+				}
+			}
+		}
+		g.newestTs = newestTs
+		g.newestPreview = newestPreview
+	}
+
+	m.groupRows = nil
+	for _, cwd := range order {
+		g := groups[cwd]
+		expanded := m.expandedGroups[cwd]
+		m.groupRows = append(m.groupRows, displayRow{
+			kind: rowKindGroup, cwd: cwd, sessionIdx: -1, count: len(g.sessionIdxs),
+		})
+		if expanded {
+			for _, idx := range g.sessionIdxs {
+				m.groupRows = append(m.groupRows, displayRow{
+					kind: rowKindSession, cwd: cwd, sessionIdx: idx,
+				})
+			}
+		}
+	}
+
+	// Clamp cursor.
+	if m.groupPickCursor >= len(m.groupRows) {
+		m.groupPickCursor = len(m.groupRows) - 1
+	}
+	if m.groupPickCursor < 0 {
+		m.groupPickCursor = 0
+	}
+}
+
+// groupMeta scans all sessions belonging to cwd and returns the newest
+// timestamp string and first user message preview.
+func (m model) groupMeta(cwd string) (newestTs, newestPreview string) {
+	for _, s := range m.sessions {
+		if abbrevPath(sessionCWD(s)) != cwd {
+			continue
+		}
+		for _, msg := range s.Messages {
+			if !msg.Timestamp.IsZero() {
+				ts := msg.Timestamp.Format("2006-01-02 15:04")
+				if ts > newestTs {
+					newestTs = ts
+				}
+			}
+			if msg.Role == "user" && msg.Text != "" && newestPreview == "" {
+				p := strings.TrimSpace(msg.Text)
+				if len([]rune(p)) > 50 {
+					p = string([]rune(p)[:50]) + "…"
+				}
+				newestPreview = p
+			}
+		}
+	}
+	if newestTs == "" {
+		newestTs = "unknown"
+	}
+	return
+}
+
+// renderGroupRow renders a single displayRow into a styled string.
+func (m model) renderGroupRow(i int) string {
+	row := m.groupRows[i]
+	selected := i == m.groupPickCursor
+
+	switch row.kind {
+	case rowKindGroup:
+		sym := "▶"
+		if m.expandedGroups[row.cwd] {
+			sym = "▼"
+		}
+		ts, preview := m.groupMeta(row.cwd)
+		label := fmt.Sprintf("%s %s  (%d)  %s  %s", sym, row.cwd, row.count, ts, preview)
+		if selected {
+			return stylePickSel.Render(label)
+		}
+		return styleHeader.Render(label)
+
+	case rowKindSession:
+		sl := sessionLabel(m.sessions[row.sessionIdx])
+		label := fmt.Sprintf("    %s", sl)
+		if row.sessionIdx == m.sessionIdx {
+			label += "  ←current"
+		}
+		if selected {
+			return stylePickSel.Render(label)
+		}
+		return label
+	}
+	return ""
+}
+
+// groupedPickerView renders the grouped session list overlay.
+func (m model) groupedPickerView() string {
+	vh := m.viewHeight()
+	lines := make([]string, 0, vh)
+
+	title := styleHeader.Render(fmt.Sprintf("Sessions grouped by directory (%d)  Tab=flat · ←/→/Enter=expand · Esc cancel", len(m.sessions)))
+	lines = append(lines, title)
+	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 70))))
+	lines = append(lines, "")
+
+	listHeight := vh - 4
+	visStart := 0
+	if m.groupPickCursor >= listHeight {
+		visStart = m.groupPickCursor - listHeight + 1
+	}
+	if visStart < 0 {
+		visStart = 0
+	}
+
+	for i := visStart; i < len(m.groupRows) && i < visStart+listHeight; i++ {
+		lines = append(lines, m.renderGroupRow(i))
+	}
+
+	for len(lines) < vh {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines[:vh], "\n") + "\n" + styleHelp.Render("Tab flat view · Esc cancel")
+}
+
+// --------------------------------------------------------------------------
+// Misc helpers
+// --------------------------------------------------------------------------
 
 func min(a, b int) int {
 	if a < b {
