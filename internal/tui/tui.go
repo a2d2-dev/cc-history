@@ -55,6 +55,7 @@ const (
 	modeHelp            // help modal overlay
 	modeRename          // inline rename input (status bar)
 	modeConfirm         // y/n confirmation prompt (e.g. duplicate)
+	modeRepath          // inline text input for changing session CWD
 )
 
 // --------------------------------------------------------------------------
@@ -143,6 +144,10 @@ type model struct {
 	// duplicate confirm
 	duplicatingSessionID string  // session pending duplication confirmation
 	confirmReturnMode    tuiMode // mode to restore if confirm is cancelled
+
+	// repath
+	repathInput     string // current typed CWD in repath mode
+	repathSessionID string // session being repathed
 }
 
 // resumeFinishedMsg is sent back by the ExecProcess callback after claude exits.
@@ -251,6 +256,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateRename(msg)
 		case modeConfirm:
 			return m.updateConfirm(msg)
+		case modeRepath:
+			return m.updateRepath(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -368,6 +375,13 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		if sess := m.session(); sess != nil {
 			m = m.startConfirmDuplicate(sess.ID, modeNormal)
+		}
+
+	case "p":
+		if sess := m.session(); sess != nil {
+			m.repathSessionID = sess.ID
+			m.repathInput = sessionCWD(sess)
+			m.mode = modeRepath
 		}
 	}
 	return m, nil
@@ -828,6 +842,93 @@ func (m model) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateRepath handles key events while the inline CWD repath input is active.
+func (m model) updateRepath(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.statusMsg = "repath cancelled"
+		m.repathSessionID = ""
+		m.mode = modeNormal
+	case "enter":
+		m = m.doRepath()
+	case "backspace", "ctrl+h":
+		if len(m.repathInput) > 0 {
+			runes := []rune(m.repathInput)
+			m.repathInput = string(runes[:len(runes)-1])
+		}
+	default:
+		if len(msg.Runes) > 0 {
+			m.repathInput += string(msg.Runes)
+		}
+	}
+	return m, nil
+}
+
+// doRepath writes the new CWD into the session JSONL file and reloads.
+func (m model) doRepath() model {
+	if m.sessionsRoot == "" {
+		m.statusMsg = "repath unavailable: no session root"
+		m.mode = modeNormal
+		return m
+	}
+	newCWD := strings.TrimSpace(m.repathInput)
+	if newCWD == "" {
+		m.statusMsg = "repath cancelled: empty path"
+		m.repathSessionID = ""
+		m.mode = modeNormal
+		return m
+	}
+
+	var sess *parser.Session
+	for _, s := range m.sessions {
+		if s.ID == m.repathSessionID {
+			sess = s
+			break
+		}
+	}
+	if sess == nil {
+		m.statusMsg = "repath failed: session not found"
+		m.repathSessionID = ""
+		m.mode = modeNormal
+		return m
+	}
+
+	oldCWD := sessionCWD(sess)
+	if err := loader.RepathSession(sess.FilePath, oldCWD, newCWD); err != nil {
+		m.statusMsg = fmt.Sprintf("repath failed: %v", err)
+		m.repathSessionID = ""
+		m.mode = modeNormal
+		return m
+	}
+
+	// Reload sessions so grouping reflects the new CWD.
+	newSessions, err := loader.LoadAllSessions(m.currentRoot())
+	if err != nil {
+		m.statusMsg = fmt.Sprintf("repath ok but reload failed: %v", err)
+		m.repathSessionID = ""
+		m.mode = modeNormal
+		return m
+	}
+	// Re-select the same session by ID.
+	newIdx := 0
+	for i, s := range newSessions {
+		if s.ID == sess.ID {
+			newIdx = i
+			break
+		}
+	}
+	m.sessions = newSessions
+	m.sessionIdx = newIdx
+	m.repathSessionID = ""
+	m.mode = modeNormal
+	m.rebuildItems()
+	m.clampCursor()
+	m.statusMsg = fmt.Sprintf("repathed to: %s", newCWD)
+	return m
+}
+
 // recomputeMatches finds all items matching the current searchQuery.
 func (m *model) recomputeMatches() {
 	m.matches = nil
@@ -951,7 +1052,10 @@ func (m model) statusBar() string {
 	}
 
 	var hint string
-	if m.mode == modeSearch {
+	if m.mode == modeRepath {
+		cursor := styleOK.Render("▋")
+		hint = styleHelp.Render(fmt.Sprintf("repath cwd: %s%s  Enter confirm · Esc cancel", m.repathInput, cursor))
+	} else if m.mode == modeSearch {
 		matchInfo := ""
 		if m.searchQuery != "" {
 			matchInfo = fmt.Sprintf(" [%d matches]", len(m.matches))
@@ -972,7 +1076,7 @@ func (m model) statusBar() string {
 		if !m.showTools {
 			toolsHint = "t show tools"
 		}
-		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · d dup · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
+		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · d dup · p repath · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
@@ -1095,6 +1199,7 @@ func (m model) helpModalView() string {
 		{"r", "resume session (claude --resume)"},
 		{"n", "rename session (custom title)"},
 		{"d", "duplicate session (copy with new UUID)"},
+		{"p", "repath session CWD (change working directory metadata)"},
 		{"a", "archive session (restore in archive view)"},
 		{"A", "toggle live / archive view"},
 		{"u", "undo last archive / restore"},
