@@ -53,6 +53,7 @@ const (
 	modeSearch         // inline search
 	modeInfo           // session info modal
 	modeHelp           // help modal overlay
+	modeRename         // inline rename input (status bar)
 )
 
 // --------------------------------------------------------------------------
@@ -131,6 +132,12 @@ type model struct {
 	showArchived bool          // true = currently viewing archived sessions
 	lastAction   *archiveAction // last archive/restore action (for undo)
 	statusMsg    string         // transient one-line status displayed in status bar
+
+	// rename
+	names            map[string]string // sessionID -> custom name (loaded from disk)
+	renameInput      string            // current text in rename input
+	renamingSessionID string           // session being renamed
+	renameReturnMode tuiMode           // mode to restore after rename completes
 }
 
 // resumeFinishedMsg is sent back by the ExecProcess callback after claude exits.
@@ -189,6 +196,7 @@ func newModelMulti(sessions []*parser.Session, idx int, sessionsRoot string) mod
 		height:         24,
 		width:          80,
 		sessionsRoot:   sessionsRoot,
+		names:          config.LoadNames(),
 	}
 	m.rebuildItems()
 	return m
@@ -234,6 +242,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateInfo(msg)
 		case modeHelp:
 			return m.updateHelp(msg)
+		case modeRename:
+			return m.updateRename(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -321,6 +331,10 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.matches) > 0 {
 			m.matchCursor = (m.matchCursor + 1) % len(m.matches)
 			m.scrollToMatch()
+		} else if m.searchQuery == "" {
+			if sess := m.session(); sess != nil {
+				m = m.startRename(sess.ID, modeNormal)
+			}
 		}
 
 	case "N":
@@ -489,6 +503,61 @@ func (m model) doUndo() model {
 	return m
 }
 
+// startRename enters rename mode for sessionID, recording returnMode to restore after.
+func (m model) startRename(sessionID string, returnMode tuiMode) model {
+	m.renamingSessionID = sessionID
+	m.renameInput = m.names[sessionID] // pre-fill with existing custom name (or "")
+	m.renameReturnMode = returnMode
+	m.mode = modeRename
+	return m
+}
+
+// updateRename handles key events while the rename input is active.
+func (m model) updateRename(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc":
+		// Cancel without saving.
+		m.mode = m.renameReturnMode
+		m.renameInput = ""
+		m.renamingSessionID = ""
+
+	case "enter":
+		// Save and return.
+		name := strings.TrimSpace(m.renameInput)
+		if m.renamingSessionID != "" {
+			if err := config.SaveName(m.renamingSessionID, name); err != nil {
+				m.statusMsg = fmt.Sprintf("rename failed: %v", err)
+			} else {
+				if name == "" {
+					delete(m.names, m.renamingSessionID)
+					m.statusMsg = "name cleared"
+				} else {
+					m.names[m.renamingSessionID] = name
+					m.statusMsg = fmt.Sprintf("renamed: %s", name)
+				}
+			}
+		}
+		m.mode = m.renameReturnMode
+		m.renameInput = ""
+		m.renamingSessionID = ""
+
+	case "backspace", "ctrl+h":
+		if len(m.renameInput) > 0 {
+			runes := []rune(m.renameInput)
+			m.renameInput = string(runes[:len(runes)-1])
+		}
+
+	default:
+		if len(msg.Runes) > 0 {
+			m.renameInput += string(msg.Runes)
+		}
+	}
+	return m, nil
+}
+
 func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.groupedPicker {
 		return m.updateGroupedPicker(msg)
@@ -513,6 +582,11 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		if m.pickCursor < len(m.sessions)-1 {
 			m.pickCursor++
+		}
+
+	case "n":
+		if m.pickCursor < len(m.sessions) {
+			m = m.startRename(m.sessions[m.pickCursor].ID, modePicker)
 		}
 
 	case "enter":
@@ -550,6 +624,15 @@ func (m model) updateGroupedPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		if m.groupPickCursor < len(m.groupRows)-1 {
 			m.groupPickCursor++
+		}
+
+	case "n":
+		if len(m.groupRows) > 0 {
+			row := m.groupRows[m.groupPickCursor]
+			if row.kind == rowKindSession && row.sessionIdx < len(m.sessions) {
+				m = m.startRename(m.sessions[row.sessionIdx].ID, modePicker)
+				m.groupedPicker = true
+			}
 		}
 
 	case "left", "right", "enter":
@@ -734,6 +817,18 @@ func (m model) mainView() string {
 }
 
 func (m model) statusBar() string {
+	// Rename mode shows an inline input line.
+	if m.mode == modeRename {
+		cursor := "█"
+		hint := styleHelp.Render(fmt.Sprintf("Rename: %s%s  Enter to save · Esc to cancel", m.renameInput, cursor))
+		pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
+		gap := m.width - lipgloss.Width(hint) - lipgloss.Width(pos)
+		if gap < 0 {
+			gap = 0
+		}
+		return hint + strings.Repeat(" ", gap) + pos
+	}
+
 	// Transient status message takes priority.
 	if m.statusMsg != "" {
 		pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
@@ -766,7 +861,7 @@ func (m model) statusBar() string {
 		if !m.showTools {
 			toolsHint = "t show tools"
 		}
-		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
+		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
@@ -794,7 +889,7 @@ func (m model) pickerView() string {
 
 	// Build picker lines.
 	lines := make([]string, 0, len(sess)+4)
-	title := styleHeader.Render(fmt.Sprintf("Sessions (%d)  ↑↓/jk navigate · Enter switch · Esc cancel", len(sess)))
+	title := styleHeader.Render(fmt.Sprintf("Sessions (%d)  ↑↓/jk navigate · n rename · Enter switch · Esc cancel", len(sess)))
 	lines = append(lines, title)
 	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 60))))
 	lines = append(lines, "")
@@ -810,7 +905,7 @@ func (m model) pickerView() string {
 
 	for i := visStart; i < len(sess) && i < visStart+(vh-4); i++ {
 		s := sess[i]
-		ts := sessionLabel(s)
+		ts := m.sessionLabel(s)
 		label := fmt.Sprintf("  %2d  %s", i+1, ts)
 		if i == m.sessionIdx {
 			label = fmt.Sprintf("  %2d  %s  ←current", i+1, ts)
@@ -830,7 +925,7 @@ func (m model) pickerView() string {
 	return strings.Join(lines[:vh], "\n") + "\n" + styleHelp.Render("press Esc to cancel")
 }
 
-func sessionLabel(s *parser.Session) string {
+func (m model) sessionLabel(s *parser.Session) string {
 	id := s.ID
 	if len(id) > 16 {
 		id = id[:16]
@@ -854,6 +949,14 @@ func sessionLabel(s *parser.Session) string {
 	}
 	if ts == "" {
 		ts = "unknown"
+	}
+	// Use custom name when available; fall back to first-message preview.
+	if custom, ok := m.names[s.ID]; ok && custom != "" {
+		name := custom
+		if len([]rune(name)) > 50 {
+			name = string([]rune(name)[:50]) + "…"
+		}
+		return fmt.Sprintf("[%s]  %s", ts, name)
 	}
 	if preview == "" {
 		preview = id
@@ -879,19 +982,21 @@ func (m model) helpModalView() string {
 		{"T", "expand / collapse tool details for focused message"},
 		{"i", "show session info"},
 		{"r", "resume session (claude --resume)"},
+		{"n", "rename session (custom title)"},
 		{"a", "archive session (restore in archive view)"},
 		{"A", "toggle live / archive view"},
 		{"u", "undo last archive / restore"},
 		{"s", "open flat session list"},
 		{"Tab", "open grouped session list"},
 		{"/", "enter search mode"},
-		{"n / N", "next / previous search match"},
+		{"n / N", "next / previous search match (or rename when no search)"},
 		{"?", "close this help"},
 		{"q / Q", "quit"},
 	}
 	listKeys := []entry{
 		{"↑ / k", "move cursor up"},
 		{"↓ / j", "move cursor down"},
+		{"n", "rename selected session"},
 		{"Enter", "select session"},
 		{"Esc / q", "close list"},
 	}
@@ -1610,7 +1715,7 @@ func (m model) renderGroupRow(i int) string {
 		return styleHeader.Render(label)
 
 	case rowKindSession:
-		sl := sessionLabel(m.sessions[row.sessionIdx])
+		sl := m.sessionLabel(m.sessions[row.sessionIdx])
 		label := fmt.Sprintf("    %s", sl)
 		if row.sessionIdx == m.sessionIdx {
 			label += "  ←current"
@@ -1628,7 +1733,7 @@ func (m model) groupedPickerView() string {
 	vh := m.viewHeight()
 	lines := make([]string, 0, vh)
 
-	title := styleHeader.Render(fmt.Sprintf("Sessions grouped by directory (%d)  Tab=flat · ←/→/Enter=expand · Esc cancel", len(m.sessions)))
+	title := styleHeader.Render(fmt.Sprintf("Sessions grouped by directory (%d)  Tab=flat · ←/→/Enter=expand · n rename · Esc cancel", len(m.sessions)))
 	lines = append(lines, title)
 	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 70))))
 	lines = append(lines, "")

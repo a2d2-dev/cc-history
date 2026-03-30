@@ -61,6 +61,46 @@ func Load() Config {
 	return cfg
 }
 
+// LoadNames reads the session rename map from ~/.config/cc-history/names.json.
+// Returns an empty map on missing or corrupt file.
+func LoadNames() map[string]string {
+	names := map[string]string{}
+	d, err := dir()
+	if err != nil {
+		return names
+	}
+	data, err := os.ReadFile(filepath.Join(d, "names.json"))
+	if err != nil {
+		return names
+	}
+	if jsonErr := json.Unmarshal(data, &names); jsonErr != nil {
+		return names
+	}
+	return names
+}
+
+// SaveName persists a custom name for sessionID. Pass name="" to delete the entry.
+func SaveName(sessionID, name string) error {
+	names := LoadNames()
+	if name == "" {
+		delete(names, sessionID)
+	} else {
+		names[sessionID] = name
+	}
+	d, err := dir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(names, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(d, "names.json"), data, 0o644)
+}
+
 // Save writes cfg to disk, creating the config directory if necessary.
 func Save(cfg Config) error {
 	d, err := dir()
