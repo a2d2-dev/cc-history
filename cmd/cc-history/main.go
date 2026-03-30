@@ -183,7 +183,7 @@ func main() {
 func runExport(args []string, globalPath string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	sessionFlag := fs.String("session", "", "session ID to export (default: current session)")
-	formatFlag := fs.String("format", "markdown", "output format: markdown or json")
+	formatFlag := fs.String("format", "markdown", "output format: markdown, json, or html")
 	fs.Parse(args) //nolint:errcheck // ExitOnError handles errors
 
 	root := resolveRoot(globalPath)
@@ -226,8 +226,13 @@ func runExport(args []string, globalPath string) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+	case "html":
+		if err := ccexport.ToHTML(os.Stdout, session); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown format %q (use markdown or json)\n", *formatFlag)
+		fmt.Fprintf(os.Stderr, "error: unknown format %q (use markdown, json, or html)\n", *formatFlag)
 		os.Exit(1)
 	}
 }
