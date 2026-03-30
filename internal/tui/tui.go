@@ -13,6 +13,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/fsnotify/fsnotify"
 
 	"github.com/a2d2-dev/cc-history/internal/config"
 	"github.com/a2d2-dev/cc-history/internal/loader"
@@ -168,6 +169,11 @@ type model struct {
 	// repath
 	repathInput     string // current typed CWD in repath mode
 	repathSessionID string // session being repathed
+
+	// live file watcher
+	watchEnabled  bool         // true = fsnotify watcher is active
+	watcherStop   chan struct{} // close to stop the watcher goroutine
+	watcherNotify chan struct{} // receives a token on each file-change batch
 }
 
 // resumeFinishedMsg is sent back by the ExecProcess callback after claude exits.
@@ -188,6 +194,10 @@ type previewLoadedMsg struct {
 	slotIdx int
 	preview string
 }
+
+// fileChangedMsg is sent when the file watcher detects a change in the
+// sessions directory.
+type fileChangedMsg struct{}
 
 // currentSlot returns the currently active session slot, or nil if none.
 func (m model) currentSlot() *sessionSlot {
@@ -302,6 +312,12 @@ func newModelFromSlots(slots []*sessionSlot, idx int, sessionsRoot string) model
 		names:          config.LoadNames(),
 	}
 	m.rebuildItems()
+	if cfg.WatcherEnabled && sessionsRoot != "" {
+		m.watchEnabled = true
+		m.watcherStop = make(chan struct{})
+		m.watcherNotify = make(chan struct{}, 1)
+		go runWatcher(m.currentRoot(), m.watcherNotify, m.watcherStop)
+	}
 	return m
 }
 
@@ -324,6 +340,9 @@ func newModel(session *parser.Session) model {
 // --------------------------------------------------------------------------
 
 func (m model) Init() tea.Cmd {
+	if m.watchEnabled && m.watcherNotify != nil {
+		return waitForWatcherEvent(m.watcherNotify)
+	}
 	return nil
 }
 
@@ -370,6 +389,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.slotIdx >= 0 && msg.slotIdx < len(m.slots) {
 			m.slots[msg.slotIdx].preview = msg.preview
 			m.slots[msg.slotIdx].previewLoaded = true
+		}
+		return m, nil
+
+	case fileChangedMsg:
+		if m.watchEnabled && m.sessionsRoot != "" {
+			m = m.doReloadSessions()
+		}
+		if m.watchEnabled && m.watcherNotify != nil {
+			return m, waitForWatcherEvent(m.watcherNotify)
 		}
 		return m, nil
 
@@ -516,6 +544,9 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.repathInput = slot.meta.CWD
 			m.mode = modeRepath
 		}
+
+	case "w":
+		return m.doToggleWatcher()
 	}
 	return m, nil
 }
@@ -812,6 +843,111 @@ func (m model) doDuplicate() model {
 	m.statusMsg = fmt.Sprintf("duplicated: %s", newID[:8]+"…")
 	m.mode = m.confirmReturnMode
 	return m
+}
+
+// doReloadSessions reloads the session list from disk, preserving the current
+// session selection by file path when possible.
+func (m model) doReloadSessions() model {
+	currentPath := ""
+	if slot := m.currentSlot(); slot != nil {
+		currentPath = slot.meta.FilePath
+	}
+	newMetas, err := loader.LoadAllSessionsMeta(m.currentRoot(), "")
+	if err != nil || len(newMetas) == 0 {
+		return m
+	}
+	newSlots := make([]*sessionSlot, len(newMetas))
+	for i, meta := range newMetas {
+		newSlots[i] = &sessionSlot{meta: meta}
+	}
+	m.slots = newSlots
+	m.sessionIdx = len(newSlots) - 1
+	if currentPath != "" {
+		for i, s := range newSlots {
+			if s.meta.FilePath == currentPath {
+				m.sessionIdx = i
+				break
+			}
+		}
+	}
+	m.expanded = make(map[int]bool)
+	m.cursor = 0
+	m.matches = nil
+	m.matchCursor = 0
+	m.rebuildItems()
+	return m
+}
+
+// doToggleWatcher toggles the live file watcher on/off.
+func (m model) doToggleWatcher() (tea.Model, tea.Cmd) {
+	if m.sessionsRoot == "" {
+		m.statusMsg = "watcher unavailable: no session root"
+		return m, nil
+	}
+	cfg := config.Load()
+	if m.watchEnabled {
+		// Stop the watcher goroutine.
+		if m.watcherStop != nil {
+			close(m.watcherStop)
+		}
+		m.watchEnabled = false
+		m.watcherStop = nil
+		m.watcherNotify = nil
+		m.statusMsg = "live watcher off"
+		cfg.WatcherEnabled = false
+		config.Save(cfg) //nolint:errcheck
+		return m, nil
+	}
+	// Start the watcher.
+	m.watcherStop = make(chan struct{})
+	m.watcherNotify = make(chan struct{}, 1)
+	m.watchEnabled = true
+	m.statusMsg = "live watcher on"
+	cfg.WatcherEnabled = true
+	config.Save(cfg) //nolint:errcheck
+	go runWatcher(m.currentRoot(), m.watcherNotify, m.watcherStop)
+	return m, waitForWatcherEvent(m.watcherNotify)
+}
+
+// waitForWatcherEvent returns a tea.Cmd that blocks until the next file-change
+// notification arrives on notify, then sends a fileChangedMsg to the program.
+func waitForWatcherEvent(notify <-chan struct{}) tea.Cmd {
+	return func() tea.Msg {
+		<-notify
+		return fileChangedMsg{}
+	}
+}
+
+// runWatcher watches dir with fsnotify, forwarding Create/Write/Remove events
+// as a single token on notify. Stops when stop is closed.
+func runWatcher(dir string, notify chan<- struct{}, stop <-chan struct{}) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return
+	}
+	defer watcher.Close()
+	_ = watcher.Add(dir)
+	for {
+		select {
+		case <-stop:
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) || event.Has(fsnotify.Remove) {
+				// Non-blocking send: drop the token if one is already queued.
+				select {
+				case notify <- struct{}{}:
+				default:
+				}
+			}
+		case _, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+		}
+	}
 }
 
 func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1273,6 +1409,9 @@ func (m model) statusBar() string {
 		if m.showArchived {
 			viewLabel = styleArchive.Render("[ARCHIVE]") + " "
 		}
+		if m.watchEnabled {
+			viewLabel += styleOK.Render("[LIVE]") + " "
+		}
 		sessionInfo := ""
 		if len(m.slots) > 1 {
 			sessionInfo = fmt.Sprintf(" s list · Tab grouped(%d)", len(m.slots))
@@ -1281,7 +1420,7 @@ func (m model) statusBar() string {
 		if !m.showTools {
 			toolsHint = "t show tools"
 		}
-		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · d dup · p repath · a archive · A toggle · u undo · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
+		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · d dup · p repath · a archive · A toggle · u undo · w watch · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
@@ -1401,6 +1540,7 @@ func (m model) helpModalView() string {
 		{"a", "archive session (restore in archive view)"},
 		{"A", "toggle live / archive view"},
 		{"u", "undo last archive / restore"},
+		{"w", "toggle live file watcher (auto-refresh)"},
 		{"s", "open flat session list"},
 		{"Tab", "open grouped session list"},
 		{"/", "enter search mode"},
