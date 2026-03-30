@@ -450,3 +450,91 @@ func TestParseFile_CorruptedLines(t *testing.T) {
 		t.Errorf("want 1 message (corrupted lines skipped), got %d", len(s.Messages))
 	}
 }
+
+func TestParseFirstMsgPreview_StringContent(t *testing.T) {
+	line := `{"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello world"}}` + "\n"
+	f, err := os.CreateTemp("", "*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.WriteString(line)
+	f.Close()
+
+	preview := parser.ParseFirstMsgPreview(f.Name())
+	if preview != "hello world" {
+		t.Errorf("want 'hello world', got %q", preview)
+	}
+}
+
+func TestParseFirstMsgPreview_Truncation(t *testing.T) {
+	longText := strings.Repeat("a", 60)
+	line := `{"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"` + longText + `"}}` + "\n"
+	f, err := os.CreateTemp("", "*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.WriteString(line)
+	f.Close()
+
+	preview := parser.ParseFirstMsgPreview(f.Name())
+	runes := []rune(preview)
+	if len(runes) > 51 { // 50 + "…"
+		t.Errorf("expected truncation at 50+ellipsis, got len=%d %q", len(runes), preview)
+	}
+	if !strings.HasSuffix(preview, "…") {
+		t.Errorf("expected ellipsis suffix, got %q", preview)
+	}
+}
+
+func TestParseFirstMsgPreview_SkipsAssistant(t *testing.T) {
+	// assistant message first, then user message
+	lines := `{"type":"assistant","sessionId":"s1","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"I can help"}}` + "\n" +
+		`{"type":"user","sessionId":"s1","uuid":"u2","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"user question"}}` + "\n"
+	f, err := os.CreateTemp("", "*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.WriteString(lines)
+	f.Close()
+
+	preview := parser.ParseFirstMsgPreview(f.Name())
+	if preview != "user question" {
+		t.Errorf("want 'user question', got %q", preview)
+	}
+}
+
+func TestParseFirstMsgPreview_EmptyFile(t *testing.T) {
+	f, err := os.CreateTemp("", "*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.Close()
+
+	preview := parser.ParseFirstMsgPreview(f.Name())
+	if preview != "" {
+		t.Errorf("want empty string for empty file, got %q", preview)
+	}
+}
+
+func TestParseFileMeta_CWD(t *testing.T) {
+	line := `{"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","cwd":"/home/user/project","message":{"role":"user","content":"hi"}}` + "\n"
+	f, err := os.CreateTemp("", "*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.WriteString(line)
+	f.Close()
+
+	meta, err := parser.ParseFileMeta(f.Name(), false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if meta.CWD != "/home/user/project" {
+		t.Errorf("want CWD '/home/user/project', got %q", meta.CWD)
+	}
+}

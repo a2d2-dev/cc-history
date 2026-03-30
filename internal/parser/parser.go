@@ -114,10 +114,12 @@ type ToolResult struct {
 // SessionMeta holds lightweight session metadata populated without full content
 // parsing. It is used by --list to avoid reading entire session files.
 type SessionMeta struct {
-	ID          string
-	FilePath    string
-	StartTime   time.Time
-	EndTime     time.Time
+	ID        string
+	FilePath  string
+	StartTime time.Time
+	EndTime   time.Time
+	// CWD is the working directory from the first record that has a non-empty cwd field.
+	CWD string
 	// LastMessage is only populated when ParseFileMeta is called with
 	// parseLastMsg=true (i.e. for the current session).
 	LastMessage *Message
@@ -130,6 +132,7 @@ type rawMetaRecord struct {
 	Type      string `json:"type"`
 	SessionID string `json:"sessionId"`
 	Timestamp string `json:"timestamp"`
+	CWD       string `json:"cwd"`
 }
 
 // ParseFileMeta scans path to extract session metadata without parsing message
@@ -177,6 +180,9 @@ func ParseFileMeta(path string, parseLastMsg bool) (*SessionMeta, error) {
 				meta.EndTime = t
 			}
 		}
+		if meta.CWD == "" && rec.CWD != "" {
+			meta.CWD = rec.CWD
+		}
 		if parseLastMsg && (rec.Type == "user" || rec.Type == "assistant") {
 			lastRoleBytes = make([]byte, len(line))
 			copy(lastRoleBytes, line)
@@ -198,6 +204,102 @@ func ParseFileMeta(path string, parseLastMsg bool) (*SessionMeta, error) {
 	}
 
 	return meta, nil
+}
+
+// rawPreviewRecord is used by ParseFirstMsgPreview. It reads just enough
+// fields to find the first user message text without allocating full content.
+type rawPreviewRecord struct {
+	Type    string `json:"type"`
+	Message *struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"message"`
+}
+
+// ParseFirstMsgPreview reads path until the first user message with non-empty
+// text content and returns that text truncated to 50 runes. Returns "" if none
+// found or on any error. This is intentionally a best-effort, fast scan.
+func ParseFirstMsgPreview(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	// Use a moderate buffer — we stop after the first user message.
+	const maxBuf = 4 * 1024 * 1024
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, maxBuf), maxBuf)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		// Quick pre-filter: skip lines that don't contain "user" to avoid
+		// full unmarshal on every line.
+		if !contains(line, "\"user\"") {
+			continue
+		}
+		// We need the full rawRecord here to handle array content properly.
+		var rec rawRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue
+		}
+		if rec.Type != "user" || rec.Message == nil || rec.Message.Role != "user" {
+			continue
+		}
+		// Extract text from content (string or array).
+		text := extractPreviewText(rec.Message.Content)
+		if text == "" {
+			continue
+		}
+		runes := []rune(strings.TrimSpace(text))
+		if len(runes) > 50 {
+			return string(runes[:50]) + "…"
+		}
+		return string(runes)
+	}
+	return ""
+}
+
+// extractPreviewText extracts plain text from a message content JSON value
+// (either a plain string or an array of content blocks).
+func extractPreviewText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	switch raw[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			return s
+		}
+	case '[':
+		var items []rawContentItem
+		if err := json.Unmarshal(raw, &items); err == nil {
+			for _, item := range items {
+				if item.Type == "text" && item.Text != "" {
+					return item.Text
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// contains reports whether b contains the substring sub (as bytes).
+func contains(b []byte, sub string) bool {
+	if len(sub) > len(b) {
+		return false
+	}
+	subB := []byte(sub)
+	for i := 0; i <= len(b)-len(subB); i++ {
+		if string(b[i:i+len(subB)]) == sub {
+			return true
+		}
+	}
+	return false
 }
 
 // --------------------------------------------------------------------------
