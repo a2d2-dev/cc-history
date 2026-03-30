@@ -356,6 +356,116 @@ func TestEditDiffRendering(t *testing.T) {
 	}
 }
 
+func TestAsyncSearchLaunchSearch(t *testing.T) {
+	s := makeSession([]*parser.Message{
+		makeMsg("user", "hello world"),
+		makeMsg("assistant", "goodbye moon"),
+	})
+	m := newModel(s)
+
+	// Enter search mode.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = updated.(model)
+	if m.mode != modeSearch {
+		t.Fatalf("expected modeSearch after /, got %d", m.mode)
+	}
+
+	// Type a character — should set searchSearching and increment searchVersion.
+	versionBefore := m.searchVersion
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	m = updated.(model)
+	if !m.searchSearching {
+		t.Error("expected searchSearching=true after typing")
+	}
+	if m.searchVersion <= versionBefore {
+		t.Error("expected searchVersion to increment")
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (background search)")
+	}
+
+	// Simulate the searchResultMsg arriving with the correct version.
+	resultMsg := searchResultMsg{query: "h", matches: []int{0, 1}, version: m.searchVersion}
+	updated, _ = m.Update(resultMsg)
+	m = updated.(model)
+	if m.searchSearching {
+		t.Error("expected searchSearching=false after result")
+	}
+	if len(m.matches) != 2 {
+		t.Errorf("expected 2 matches, got %d", len(m.matches))
+	}
+}
+
+func TestAsyncSearchStaleResultDiscarded(t *testing.T) {
+	s := makeSession([]*parser.Message{makeMsg("user", "hello")})
+	m := newModel(s)
+	m.mode = modeSearch
+	m.searchQuery = "h"
+	m.searchVersion = 5
+	m.searchSearching = true
+
+	// Stale result (version=3) should be ignored.
+	staleMsg := searchResultMsg{query: "h", matches: []int{0}, version: 3}
+	updated, _ := m.Update(staleMsg)
+	m = updated.(model)
+	if !m.searchSearching {
+		t.Error("stale result should not clear searchSearching")
+	}
+	if len(m.matches) != 0 {
+		t.Error("stale result should not update matches")
+	}
+}
+
+func TestAsyncSearchEscCancels(t *testing.T) {
+	s := makeSession([]*parser.Message{makeMsg("user", "hello")})
+	m := newModel(s)
+	m.mode = modeSearch
+	m.searchQuery = "hello"
+	m.searchSearching = true
+	m.searchVersion = 2
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	if m.mode != modeNormal {
+		t.Errorf("expected modeNormal after Esc, got %d", m.mode)
+	}
+	if m.searchSearching {
+		t.Error("expected searchSearching=false after Esc")
+	}
+	if m.searchQuery != "" {
+		t.Error("expected empty searchQuery after Esc")
+	}
+}
+
+func TestSpinnerTickStopsWhenNotSearching(t *testing.T) {
+	s := makeSession([]*parser.Message{makeMsg("user", "hi")})
+	m := newModel(s)
+	m.searchSearching = false
+	m.spinnerFrame = 3
+
+	// Tick while not searching should be a no-op (no further cmd).
+	_, cmd := m.Update(spinnerTickMsg{frame: 4})
+	if cmd != nil {
+		t.Error("expected nil cmd when not searching")
+	}
+}
+
+func TestSpinnerTickAdvancesFrameWhenSearching(t *testing.T) {
+	s := makeSession([]*parser.Message{makeMsg("user", "hi")})
+	m := newModel(s)
+	m.searchSearching = true
+	m.spinnerFrame = 0
+
+	updated, cmd := m.Update(spinnerTickMsg{frame: 1})
+	m = updated.(model)
+	if m.spinnerFrame != 1 {
+		t.Errorf("expected spinnerFrame=1, got %d", m.spinnerFrame)
+	}
+	if cmd == nil {
+		t.Error("expected another tick cmd while still searching")
+	}
+}
+
 // collectTexts extracts all item texts.
 func collectTexts(items []item) []string {
 	out := make([]string, len(items))

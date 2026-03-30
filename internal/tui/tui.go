@@ -19,6 +19,9 @@ import (
 	"github.com/a2d2-dev/cc-history/internal/parser"
 )
 
+// spinnerFrames are the characters cycled for the search progress indicator.
+var spinnerFrames = []rune(`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`)
+
 // --------------------------------------------------------------------------
 // Styles
 // --------------------------------------------------------------------------
@@ -115,10 +118,13 @@ type model struct {
 	totalLines int
 
 	// search
-	mode        tuiMode
-	searchQuery string
-	matches     []int // item indices that match the search query
-	matchCursor int   // current position in matches
+	mode           tuiMode
+	searchQuery    string
+	matches        []int // item indices that match the search query
+	matchCursor    int   // current position in matches
+	searchSearching bool  // true while a background search is running
+	searchVersion  int   // incremented on each new query; used to discard stale results
+	spinnerFrame   int   // current spinner animation frame
 
 	// session picker (flat list)
 	pickCursor int
@@ -152,6 +158,16 @@ type model struct {
 
 // resumeFinishedMsg is sent back by the ExecProcess callback after claude exits.
 type resumeFinishedMsg struct{ err error }
+
+// searchResultMsg carries results from the background search goroutine.
+type searchResultMsg struct {
+	query   string
+	matches []int
+	version int // matches model.searchVersion at dispatch time
+}
+
+// spinnerTickMsg advances the spinner animation frame.
+type spinnerTickMsg struct{ frame int }
 
 // session returns the currently active session.
 func (m model) session() *parser.Session {
@@ -241,6 +257,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = "returned from claude"
 		}
 		return m, nil
+
+	case searchResultMsg:
+		// Discard stale results from a superseded query.
+		if msg.version != m.searchVersion {
+			return m, nil
+		}
+		m.matches = msg.matches
+		m.searchSearching = false
+		if m.matchCursor >= len(m.matches) {
+			m.matchCursor = 0
+		}
+		if len(m.matches) > 0 {
+			m.scrollToMatch()
+		}
+		return m, nil
+
+	case spinnerTickMsg:
+		if !m.searchSearching {
+			return m, nil // search finished; stop ticking
+		}
+		m.spinnerFrame = msg.frame
+		return m, spinnerTickCmd(m.spinnerFrame)
 
 	case tea.KeyMsg:
 		switch m.mode {
@@ -797,6 +835,7 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.searchQuery = ""
 		m.matches = nil
 		m.matchCursor = 0
+		m.searchSearching = false
 
 	case "enter":
 		// Confirm search, stay in search mode but allow n/N navigation.
@@ -806,20 +845,49 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.searchQuery) > 0 {
 			runes := []rune(m.searchQuery)
 			m.searchQuery = string(runes[:len(runes)-1])
-			m.recomputeMatches()
+			return m, m.launchSearch()
 		}
 
 	default:
 		if len(msg.Runes) > 0 {
 			m.searchQuery += string(msg.Runes)
-			m.recomputeMatches()
-			if len(m.matches) > 0 {
-				m.matchCursor = 0
-				m.scrollToMatch()
-			}
+			return m, m.launchSearch()
 		}
 	}
 	return m, nil
+}
+
+// launchSearch starts an async background search for the current searchQuery.
+// It returns a tea.Cmd that will send a searchResultMsg when done.
+// If searchQuery is empty the matches are cleared immediately.
+func (m *model) launchSearch() tea.Cmd {
+	if m.searchQuery == "" {
+		m.matches = nil
+		m.matchCursor = 0
+		m.searchSearching = false
+		return nil
+	}
+	m.searchVersion++
+	m.searchSearching = true
+	m.spinnerFrame = 0
+
+	// Snapshot the items and version to avoid data races.
+	items := m.items
+	version := m.searchVersion
+	query := m.searchQuery
+
+	searchCmd := func() tea.Msg {
+		q := strings.ToLower(query)
+		var matches []int
+		for i, it := range items {
+			if strings.Contains(strings.ToLower(it.plain), q) {
+				matches = append(matches, i)
+			}
+		}
+		return searchResultMsg{query: query, matches: matches, version: version}
+	}
+
+	return tea.Batch(searchCmd, spinnerTickCmd(0))
 }
 
 func (m model) updateInfo(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -947,6 +1015,13 @@ func (m *model) recomputeMatches() {
 	}
 }
 
+// spinnerTickCmd schedules the next spinner animation frame (80ms interval).
+func spinnerTickCmd(frame int) tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(_ time.Time) tea.Msg {
+		return spinnerTickMsg{frame: (frame + 1) % len(spinnerFrames)}
+	})
+}
+
 // scrollToMatch sets cursor so the current match is visible.
 func (m *model) scrollToMatch() {
 	if len(m.matches) == 0 {
@@ -1056,13 +1131,21 @@ func (m model) statusBar() string {
 		cursor := styleOK.Render("▋")
 		hint = styleHelp.Render(fmt.Sprintf("repath cwd: %s%s  Enter confirm · Esc cancel", m.repathInput, cursor))
 	} else if m.mode == modeSearch {
-		matchInfo := ""
-		if m.searchQuery != "" {
+		var matchInfo string
+		if m.searchSearching {
+			spinner := string(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
+			matchInfo = fmt.Sprintf(" %s searching…", spinner)
+		} else if m.searchQuery != "" {
 			matchInfo = fmt.Sprintf(" [%d matches]", len(m.matches))
 		}
 		hint = styleHelp.Render(fmt.Sprintf("search: %s%s  ESC cancel · Enter confirm · n/N jump", m.searchQuery, matchInfo))
 	} else if m.searchQuery != "" {
-		hint = styleHelp.Render(fmt.Sprintf("/%s  [%d/%d]  n next · N prev · / new search", m.searchQuery, m.matchCursor+1, len(m.matches)))
+		statusPart := fmt.Sprintf("[%d/%d]", m.matchCursor+1, len(m.matches))
+		if m.searchSearching {
+			spinner := string(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
+			statusPart = fmt.Sprintf("%s …", spinner)
+		}
+		hint = styleHelp.Render(fmt.Sprintf("/%s  %s  n next · N prev · / new search", m.searchQuery, statusPart))
 	} else {
 		viewLabel := ""
 		if m.showArchived {
