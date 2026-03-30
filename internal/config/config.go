@@ -22,6 +22,10 @@ type Config struct {
 	FilterPath string `json:"filter_path"`
 	// WatcherEnabled controls the file-watcher for live session updates.
 	WatcherEnabled bool `json:"watcher_enabled"`
+	// ClaudePath is the path to the claude binary (empty = use CLAUDE_COMMAND env or "claude").
+	ClaudePath string `json:"claude_path"`
+	// Theme selects the color theme ("default" or "dark").
+	Theme string `json:"theme"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.

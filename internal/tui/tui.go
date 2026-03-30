@@ -60,6 +60,7 @@ const (
 	modeRename          // inline rename input (status bar)
 	modeConfirm         // y/n confirmation prompt (e.g. duplicate)
 	modeRepath          // inline text input for changing session CWD
+	modeSettings        // settings modal overlay
 )
 
 // --------------------------------------------------------------------------
@@ -174,6 +175,10 @@ type model struct {
 	watchEnabled  bool         // true = fsnotify watcher is active
 	watcherStop   chan struct{} // close to stop the watcher goroutine
 	watcherNotify chan struct{} // receives a token on each file-change batch
+
+	// settings modal
+	settingsCursor int       // which field is focused (0–3)
+	settingsValues [4]string // temp edit buffer: [claudePath, sortOrder, groupedMode, theme]
 }
 
 // resumeFinishedMsg is sent back by the ExecProcess callback after claude exits.
@@ -417,6 +422,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirm(msg)
 		case modeRepath:
 			return m.updateRepath(msg)
+		case modeSettings:
+			return m.updateSettings(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -547,8 +554,29 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "w":
 		return m.doToggleWatcher()
+
+	case ",":
+		m = m.openSettings()
 	}
 	return m, nil
+}
+
+// openSettings initialises the settings modal state from the current config.
+func (m model) openSettings() model {
+	cfg := config.Load()
+	groupedStr := "off"
+	if cfg.GroupedMode {
+		groupedStr = "on"
+	}
+	m.settingsCursor = 0
+	m.settingsValues = [4]string{
+		cfg.ClaudePath,
+		cfg.SortOrder,
+		groupedStr,
+		cfg.Theme,
+	}
+	m.mode = modeSettings
+	return m
 }
 
 // doArchive archives (or restores) the currently selected session.
@@ -1188,6 +1216,97 @@ func (m model) updateRepath(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// --------------------------------------------------------------------------
+// Settings constants
+// --------------------------------------------------------------------------
+
+const (
+	settingsFieldClaudePath  = 0
+	settingsFieldSortOrder   = 1
+	settingsFieldGroupedMode = 2
+	settingsFieldTheme       = 3
+	settingsFieldCount       = 4
+)
+
+var settingsFieldNames = [settingsFieldCount]string{
+	"Claude path",
+	"Sort order",
+	"Grouped mode",
+	"Theme",
+}
+
+// updateSettings handles keypresses inside the settings modal.
+func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc":
+		// Discard changes.
+		m.mode = modeNormal
+
+	case "enter":
+		// Save and close.
+		m = m.saveSettings()
+		m.mode = modeNormal
+
+	case "tab", "down", "j":
+		m.settingsCursor = (m.settingsCursor + 1) % settingsFieldCount
+
+	case "shift+tab", "up", "k":
+		m.settingsCursor = (m.settingsCursor - 1 + settingsFieldCount) % settingsFieldCount
+
+	case "left", "right", " ":
+		// Cycle toggle fields.
+		switch m.settingsCursor {
+		case settingsFieldSortOrder:
+			if m.settingsValues[settingsFieldSortOrder] == "asc" {
+				m.settingsValues[settingsFieldSortOrder] = "desc"
+			} else {
+				m.settingsValues[settingsFieldSortOrder] = "asc"
+			}
+		case settingsFieldGroupedMode:
+			if m.settingsValues[settingsFieldGroupedMode] == "on" {
+				m.settingsValues[settingsFieldGroupedMode] = "off"
+			} else {
+				m.settingsValues[settingsFieldGroupedMode] = "on"
+			}
+		case settingsFieldTheme:
+			themes := []string{"default", "dark"}
+			cur := m.settingsValues[settingsFieldTheme]
+			next := "default"
+			for i, t := range themes {
+				if t == cur {
+					next = themes[(i+1)%len(themes)]
+					break
+				}
+			}
+			m.settingsValues[settingsFieldTheme] = next
+		}
+
+	case "backspace", "ctrl+h":
+		// Delete last rune in text fields.
+		switch m.settingsCursor {
+		case settingsFieldClaudePath, settingsFieldTheme:
+			v := m.settingsValues[m.settingsCursor]
+			runes := []rune(v)
+			if len(runes) > 0 {
+				m.settingsValues[m.settingsCursor] = string(runes[:len(runes)-1])
+			}
+		}
+
+	default:
+		// Append printable chars to text fields.
+		if len(msg.Runes) > 0 {
+			switch m.settingsCursor {
+			case settingsFieldClaudePath, settingsFieldTheme:
+				m.settingsValues[m.settingsCursor] += string(msg.Runes)
+			}
+		}
+	}
+	return m, nil
+}
+
 // doRepath writes the new CWD into the session JSONL file and reloads.
 func (m model) doRepath() model {
 	if m.sessionsRoot == "" {
@@ -1255,6 +1374,18 @@ func (m model) doRepath() model {
 	return m
 }
 
+// saveSettings writes the edited values back to config.
+func (m model) saveSettings() model {
+	cfg := config.Load()
+	cfg.ClaudePath = strings.TrimSpace(m.settingsValues[settingsFieldClaudePath])
+	cfg.SortOrder = m.settingsValues[settingsFieldSortOrder]
+	cfg.GroupedMode = m.settingsValues[settingsFieldGroupedMode] == "on"
+	cfg.Theme = strings.TrimSpace(m.settingsValues[settingsFieldTheme])
+	config.Save(cfg) //nolint:errcheck
+	m.statusMsg = "settings saved"
+	return m
+}
+
 // recomputeMatches finds all items matching the current searchQuery.
 func (m *model) recomputeMatches() {
 	m.matches = nil
@@ -1308,6 +1439,8 @@ func (m model) View() string {
 		return m.infoModalView()
 	case modeHelp:
 		return m.helpModalView()
+	case modeSettings:
+		return m.settingsModalView()
 	default:
 		return m.mainView()
 	}
@@ -1420,7 +1553,7 @@ func (m model) statusBar() string {
 		if !m.showTools {
 			toolsHint = "t show tools"
 		}
-		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · d dup · p repath · a archive · A toggle · u undo · w watch · / search · i info%s · ? help · q quit", toolsHint, sessionInfo))
+		hint = viewLabel + styleHelp.Render(fmt.Sprintf("↑↓/jk scroll · %s · T expand · r resume · n rename · d dup · p repath · a archive · A toggle · u undo · w watch · / search · i info · , settings%s · ? help · q quit", toolsHint, sessionInfo))
 	}
 
 	pos := styleDim.Render(fmt.Sprintf(" %d%%", m.scrollPct()))
@@ -1533,6 +1666,7 @@ func (m model) helpModalView() string {
 		{"t", "hide / show all tool calls"},
 		{"T", "expand / collapse tool details for focused message"},
 		{"i", "show session info"},
+		{",", "open settings modal"},
 		{"r", "resume session (claude --resume)"},
 		{"n", "rename session (custom title)"},
 		{"d", "duplicate session (copy with new UUID)"},
@@ -1712,6 +1846,87 @@ func (m model) infoModalView() string {
 			break
 		}
 		// Pad modal line to full width for clean overlay.
+		plain := stripANSI(ml)
+		pad := m.width - len([]rune(plain))
+		if pad < 0 {
+			pad = 0
+		}
+		mainLines[row] = ml + strings.Repeat(" ", pad)
+	}
+
+	return strings.Join(mainLines, "\n")
+}
+
+// settingsModalView renders the settings form as a centered overlay.
+func (m model) settingsModalView() string {
+	labels := settingsFieldNames
+	values := m.settingsValues
+
+	// Build modal lines.
+	title := styleHeader.Render("Settings")
+	sep := styleBorder.Render(strings.Repeat("─", 46))
+
+	var bodyLines []string
+	for i := 0; i < settingsFieldCount; i++ {
+		focused := i == m.settingsCursor
+		label := fmt.Sprintf("%-14s", labels[i])
+		val := values[i]
+
+		var fieldStr string
+		switch i {
+		case settingsFieldSortOrder, settingsFieldGroupedMode, settingsFieldTheme:
+			// Cycle field — show value in brackets.
+			if focused {
+				fieldStr = stylePickSel.Render(fmt.Sprintf(" ◀ %s ▶ ", val))
+			} else {
+				fieldStr = styleDim.Render(fmt.Sprintf("   %s   ", val))
+			}
+		default:
+			// Text field — show value with cursor indicator.
+			display := val
+			if display == "" {
+				display = "(empty)"
+			}
+			if focused {
+				fieldStr = styleUser.Render("[" + display + "_]")
+			} else {
+				fieldStr = "[" + display + "]"
+			}
+		}
+
+		prefix := "  "
+		if focused {
+			prefix = styleOK.Render("▶ ")
+		}
+		bodyLines = append(bodyLines, fmt.Sprintf("%s%-14s  %s", prefix, label, fieldStr))
+	}
+
+	modalLines := []string{
+		"",
+		"  " + title,
+		"  " + sep,
+		"",
+	}
+	modalLines = append(modalLines, bodyLines...)
+	modalLines = append(modalLines, "")
+	modalLines = append(modalLines, styleHelp.Render("  Tab/↑↓ navigate · ←/→/Space cycle · type to edit · Enter save · Esc cancel"))
+	modalLines = append(modalLines, "")
+
+	// Overlay on main view.
+	main := m.mainView()
+	mainLines := strings.Split(main, "\n")
+	vh := m.viewHeight()
+
+	startRow := (vh - len(modalLines)) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+
+	for i, ml := range modalLines {
+		row := startRow + i
+		if row >= len(mainLines) {
+			break
+		}
 		plain := stripANSI(ml)
 		pad := m.width - len([]rune(plain))
 		if pad < 0 {
@@ -2017,10 +2232,14 @@ func (m model) launchPreviewLoads() tea.Cmd {
 }
 
 // claudeCmd returns the claude binary name/path to use.
-// Controlled by the CLAUDE_COMMAND environment variable; defaults to "claude".
+// Controlled by the CLAUDE_COMMAND environment variable, then by config ClaudePath;
+// defaults to "claude".
 func claudeCmd() string {
 	if v := os.Getenv("CLAUDE_COMMAND"); v != "" {
 		return v
+	}
+	if p := config.Load().ClaudePath; p != "" {
+		return p
 	}
 	return "claude"
 }
