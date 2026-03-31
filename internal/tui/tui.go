@@ -52,15 +52,14 @@ var (
 type tuiMode int
 
 const (
-	modeNormal  tuiMode = iota
-	modePicker          // session list overlay
-	modeSearch          // inline search
-	modeInfo            // session info modal
-	modeHelp            // help modal overlay
-	modeRename          // inline rename input (status bar)
-	modeConfirm         // y/n confirmation prompt (e.g. duplicate)
-	modeRepath          // inline text input for changing session CWD
-	modeSettings        // settings modal overlay
+	modeNormal   tuiMode = iota
+	modeSearch           // inline search
+	modeInfo             // session info modal
+	modeHelp             // help modal overlay
+	modeRename           // inline rename input (status bar)
+	modeConfirm          // y/n confirmation prompt (e.g. duplicate)
+	modeRepath           // inline text input for changing session CWD
+	modeSettings         // settings modal overlay
 )
 
 // --------------------------------------------------------------------------
@@ -142,14 +141,18 @@ type model struct {
 	searchVersion  int   // incremented on each new query; used to discard stale results
 	spinnerFrame   int   // current spinner animation frame
 
-	// session picker (flat list)
+	// split-pane layout
+	focusLeft  bool // true = left pane (session list) has keyboard focus
+	leftScroll int  // scroll offset for left pane session list
+
+	// session picker (flat list) - used within left pane
 	pickCursor int
 
-	// grouped session list
-	groupedPicker  bool            // true = show grouped picker, false = flat picker
-	expandedGroups map[string]bool // cwd -> expanded; persists for the session
-	groupRows      []displayRow    // computed rows for grouped view (rebuilt on toggle)
-	groupPickCursor int            // cursor position in groupRows
+	// grouped session list - used within left pane
+	groupedPicker   bool            // true = show grouped list, false = flat list
+	expandedGroups  map[string]bool // cwd -> expanded; persists for the session
+	groupRows       []displayRow    // computed rows for grouped view (rebuilt on toggle)
+	groupPickCursor int             // cursor position in groupRows
 
 	// archive / restore
 	sessionsRoot string         // live sessions root (e.g. ~/.claude/projects)
@@ -315,7 +318,10 @@ func newModelFromSlots(slots []*sessionSlot, idx int, sessionsRoot string) model
 		width:          80,
 		sessionsRoot:   sessionsRoot,
 		names:          config.LoadNames(),
+		pickCursor:     idx,
+		groupPickCursor: 0,
 	}
+	m.buildGroupRows()
 	m.rebuildItems()
 	if cfg.WatcherEnabled && sessionsRoot != "" {
 		m.watchEnabled = true
@@ -358,6 +364,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.rebuildItems()
 		m.clampCursor()
+		m.clampLeftScroll()
 		return m, nil
 
 	case resumeFinishedMsg:
@@ -408,8 +415,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch m.mode {
-		case modePicker:
-			return m.updatePicker(msg)
 		case modeSearch:
 			return m.updateSearch(msg)
 		case modeInfo:
@@ -434,6 +439,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Clear transient status on any key.
 	m.statusMsg = ""
+
+	// When left pane has focus, route navigation keys there.
+	if m.focusLeft {
+		return m.updateLeftPane(msg)
+	}
 
 	switch msg.String() {
 	case "q", "Q", "ctrl+c":
@@ -488,18 +498,22 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "s":
+		// Focus left pane with flat session list.
 		if len(m.slots) > 1 {
-			m.mode = modePicker
+			m.focusLeft = true
 			m.groupedPicker = false
 			m.pickCursor = m.sessionIdx
+			m.clampLeftScroll()
 			return m, m.launchPreviewLoads()
 		}
 
 	case "tab":
+		// Focus left pane with grouped session list.
 		if len(m.slots) > 1 {
-			m.mode = modePicker
+			m.focusLeft = true
 			m.groupedPicker = true
 			m.buildGroupRows()
+			m.clampLeftScroll()
 			return m, m.launchPreviewLoads()
 		}
 
@@ -557,6 +571,161 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case ",":
 		m = m.openSettings()
+	}
+	return m, nil
+}
+
+// updateLeftPane handles keyboard input when the left pane (session list) has focus.
+func (m model) updateLeftPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.groupedPicker {
+		return m.updateLeftGrouped(msg)
+	}
+	return m.updateLeftFlat(msg)
+}
+
+// updateLeftFlat handles keyboard input for the flat session list in the left pane.
+func (m model) updateLeftFlat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc", "q", "Q":
+		m.focusLeft = false
+
+	case "tab":
+		// Switch to grouped view within left pane.
+		m.groupedPicker = true
+		m.buildGroupRows()
+		return m, m.launchPreviewLoads()
+
+	case "up", "k":
+		if m.pickCursor > 0 {
+			m.pickCursor--
+			m.clampLeftScroll()
+			return m, m.launchPreviewLoads()
+		}
+
+	case "down", "j":
+		if m.pickCursor < len(m.slots)-1 {
+			m.pickCursor++
+			m.clampLeftScroll()
+			return m, m.launchPreviewLoads()
+		}
+
+	case "home", "g":
+		m.pickCursor = 0
+		m.clampLeftScroll()
+
+	case "end", "G":
+		if len(m.slots) > 0 {
+			m.pickCursor = len(m.slots) - 1
+			m.clampLeftScroll()
+		}
+
+	case "n":
+		if m.pickCursor < len(m.slots) {
+			m = m.startRename(m.slots[m.pickCursor].meta.ID, modeNormal)
+		}
+
+	case "enter":
+		if m.pickCursor != m.sessionIdx {
+			m.sessionIdx = m.pickCursor
+			m.expanded = make(map[int]bool)
+			m.cursor = 0
+			m.searchQuery = ""
+			m.matches = nil
+			m.matchCursor = 0
+			m.rebuildItems()
+		}
+		m.focusLeft = false
+
+	case "d":
+		if m.pickCursor < len(m.slots) {
+			m = m.startConfirmDuplicate(m.slots[m.pickCursor].meta.ID, modeNormal)
+		}
+	}
+	return m, nil
+}
+
+// updateLeftGrouped handles keyboard input for the grouped session list in the left pane.
+func (m model) updateLeftGrouped(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc", "q", "Q":
+		m.focusLeft = false
+
+	case "tab":
+		// Switch to flat view within left pane.
+		m.groupedPicker = false
+		m.pickCursor = m.sessionIdx
+		m.clampLeftScroll()
+		return m, m.launchPreviewLoads()
+
+	case "up", "k":
+		if m.groupPickCursor > 0 {
+			m.groupPickCursor--
+			m.clampLeftScroll()
+			return m, m.launchPreviewLoads()
+		}
+
+	case "down", "j":
+		if m.groupPickCursor < len(m.groupRows)-1 {
+			m.groupPickCursor++
+			m.clampLeftScroll()
+			return m, m.launchPreviewLoads()
+		}
+
+	case "home", "g":
+		m.groupPickCursor = 0
+		m.clampLeftScroll()
+
+	case "end", "G":
+		if len(m.groupRows) > 0 {
+			m.groupPickCursor = len(m.groupRows) - 1
+			m.clampLeftScroll()
+		}
+
+	case "left", "right", "enter":
+		if len(m.groupRows) == 0 {
+			break
+		}
+		row := m.groupRows[m.groupPickCursor]
+		switch row.kind {
+		case rowKindGroup:
+			m.expandedGroups[row.cwd] = !m.expandedGroups[row.cwd]
+			m.buildGroupRows()
+		case rowKindSession:
+			if row.sessionIdx != m.sessionIdx {
+				m.sessionIdx = row.sessionIdx
+				m.expanded = make(map[int]bool)
+				m.cursor = 0
+				m.searchQuery = ""
+				m.matches = nil
+				m.matchCursor = 0
+				m.rebuildItems()
+			}
+			if msg.String() == "enter" {
+				m.focusLeft = false
+			}
+		}
+
+	case "n":
+		if len(m.groupRows) > 0 {
+			row := m.groupRows[m.groupPickCursor]
+			if row.kind == rowKindSession {
+				m = m.startRename(m.slots[row.sessionIdx].meta.ID, modeNormal)
+			}
+		}
+
+	case "d":
+		if len(m.groupRows) > 0 {
+			row := m.groupRows[m.groupPickCursor]
+			if row.kind == rowKindSession {
+				m = m.startConfirmDuplicate(m.slots[row.sessionIdx].meta.ID, modeNormal)
+			}
+		}
 	}
 	return m, nil
 }
@@ -978,134 +1147,6 @@ func runWatcher(dir string, notify chan<- struct{}, stop <-chan struct{}) {
 	}
 }
 
-func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.groupedPicker {
-		return m.updateGroupedPicker(msg)
-	}
-
-	switch msg.String() {
-	case "ctrl+c":
-		return m, tea.Quit
-
-	case "esc", "q":
-		m.mode = modeNormal
-
-	case "tab":
-		m.groupedPicker = true
-		m.buildGroupRows()
-
-	case "up", "k":
-		if m.pickCursor > 0 {
-			m.pickCursor--
-			return m, m.launchPreviewLoads()
-		}
-
-	case "down", "j":
-		if m.pickCursor < len(m.slots)-1 {
-			m.pickCursor++
-			return m, m.launchPreviewLoads()
-		}
-
-	case "n":
-		if m.pickCursor < len(m.slots) {
-			m = m.startRename(m.slots[m.pickCursor].meta.ID, modePicker)
-		}
-
-	case "enter":
-		if m.pickCursor != m.sessionIdx {
-			m.sessionIdx = m.pickCursor
-			m.expanded = make(map[int]bool)
-			m.cursor = 0
-			m.searchQuery = ""
-			m.matches = nil
-			m.matchCursor = 0
-			m.rebuildItems()
-		}
-		m.mode = modeNormal
-
-	case "d":
-		if m.pickCursor < len(m.slots) {
-			m = m.startConfirmDuplicate(m.slots[m.pickCursor].meta.ID, modePicker)
-		}
-	}
-	return m, nil
-}
-
-func (m model) updateGroupedPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c":
-		return m, tea.Quit
-
-	case "esc", "q":
-		m.mode = modeNormal
-
-	case "tab":
-		m.groupedPicker = false
-		m.pickCursor = m.sessionIdx
-		return m, m.launchPreviewLoads()
-
-	case "up", "k":
-		if m.groupPickCursor > 0 {
-			m.groupPickCursor--
-			return m, m.launchPreviewLoads()
-		}
-
-	case "down", "j":
-		if m.groupPickCursor < len(m.groupRows)-1 {
-			m.groupPickCursor++
-			return m, m.launchPreviewLoads()
-		}
-
-	case "n":
-		if len(m.groupRows) > 0 {
-			row := m.groupRows[m.groupPickCursor]
-			if row.kind == rowKindSession && row.sessionIdx < len(m.slots) {
-				m = m.startRename(m.slots[row.sessionIdx].meta.ID, modePicker)
-				m.groupedPicker = true
-			}
-		}
-
-	case "left", "right", "enter":
-		if len(m.groupRows) == 0 {
-			break
-		}
-		row := m.groupRows[m.groupPickCursor]
-		switch row.kind {
-		case rowKindGroup:
-			// Expand or collapse the group.
-			m.expandedGroups[row.cwd] = !m.expandedGroups[row.cwd]
-			m.buildGroupRows()
-			// Keep cursor on the same group after rebuild.
-			for i, r := range m.groupRows {
-				if r.kind == rowKindGroup && r.cwd == row.cwd {
-					m.groupPickCursor = i
-					break
-				}
-			}
-		case rowKindSession:
-			// Select this session and return to message view.
-			if row.sessionIdx != m.sessionIdx {
-				m.sessionIdx = row.sessionIdx
-				m.expanded = make(map[int]bool)
-				m.cursor = 0
-				m.searchQuery = ""
-				m.matches = nil
-				m.matchCursor = 0
-				m.rebuildItems()
-			}
-			m.mode = modeNormal
-		}
-
-	case "d":
-		if len(m.groupRows) > 0 {
-			row := m.groupRows[m.groupPickCursor]
-			if row.kind == rowKindSession && row.sessionIdx < len(m.slots) {
-				m = m.startConfirmDuplicate(m.slots[row.sessionIdx].meta.ID, modePicker)
-			}
-		}
-	}
-	return m, nil
-}
 
 func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -1430,11 +1471,6 @@ func (m *model) scrollToMatch() {
 
 func (m model) View() string {
 	switch m.mode {
-	case modePicker:
-		if m.groupedPicker {
-			return m.groupedPickerView()
-		}
-		return m.pickerView()
 	case modeInfo:
 		return m.infoModalView()
 	case modeHelp:
@@ -1442,7 +1478,7 @@ func (m model) View() string {
 	case modeSettings:
 		return m.settingsModalView()
 	default:
-		return m.mainView()
+		return m.splitView()
 	}
 }
 
@@ -1485,6 +1521,256 @@ func (m model) mainView() string {
 
 	statusBar := m.statusBar()
 	return strings.Join(lines, "\n") + "\n" + statusBar
+}
+
+// --------------------------------------------------------------------------
+// Split-pane layout
+// --------------------------------------------------------------------------
+
+// leftPaneWidth returns the number of columns dedicated to the left (session list) pane.
+func (m model) leftPaneWidth() int {
+	w := m.width * 30 / 100
+	if w < 22 {
+		w = 22
+	}
+	if w > 45 {
+		w = 45
+	}
+	return w
+}
+
+// rightPaneWidth returns the number of columns available for the right (conversation) pane.
+func (m model) rightPaneWidth() int {
+	rw := m.width - m.leftPaneWidth() - 1 // 1 for divider
+	if rw < 20 {
+		rw = 20
+	}
+	return rw
+}
+
+// clampLeftScroll adjusts m.leftScroll so the active cursor row is visible in the left pane.
+func (m *model) clampLeftScroll() {
+	vh := m.viewHeight() - 1 // one line for header
+	if vh <= 0 {
+		return
+	}
+	cursor := m.pickCursor
+	if m.groupedPicker {
+		cursor = m.groupPickCursor
+	}
+	if cursor < m.leftScroll {
+		m.leftScroll = cursor
+	}
+	if cursor >= m.leftScroll+vh {
+		m.leftScroll = cursor - vh + 1
+	}
+	if m.leftScroll < 0 {
+		m.leftScroll = 0
+	}
+}
+
+// splitView renders the full-screen split-pane layout: left session list + right conversation.
+func (m model) splitView() string {
+	lw := m.leftPaneWidth()
+	rw := m.rightPaneWidth()
+	vh := m.viewHeight() // total content rows (height - 1 for status bar)
+
+	left := m.leftPaneContent(lw, vh)
+	right := m.rightPaneContent(rw, vh)
+
+	// Build divider column.
+	divStyle := styleBorder
+	divLines := make([]string, vh)
+	for i := range divLines {
+		divLines[i] = divStyle.Render("│")
+	}
+	divider := strings.Join(divLines, "\n")
+
+	// Join panes horizontally line by line for precise control.
+	leftLines := strings.Split(left, "\n")
+	divLines2 := strings.Split(divider, "\n")
+	rightLines := strings.Split(right, "\n")
+
+	var rows []string
+	for i := 0; i < vh; i++ {
+		l := ""
+		if i < len(leftLines) {
+			l = leftLines[i]
+		}
+		d := ""
+		if i < len(divLines2) {
+			d = divLines2[i]
+		}
+		r := ""
+		if i < len(rightLines) {
+			r = rightLines[i]
+		}
+		rows = append(rows, l+d+r)
+	}
+
+	body := strings.Join(rows, "\n")
+	return body + "\n" + m.statusBar()
+}
+
+// leftPaneContent renders the session list pane content (vh lines, lw columns wide).
+func (m model) leftPaneContent(lw, vh int) string {
+	lines := make([]string, 0, vh)
+
+	// Header line.
+	listLen := len(m.slots)
+	if m.groupedPicker {
+		listLen = len(m.groupRows)
+	}
+	_ = listLen
+	title := "Sessions"
+	if m.groupedPicker {
+		title = "Sessions (grouped)"
+	}
+	if m.focusLeft {
+		headerStr := stylePickSel.Width(lw).Render(title)
+		lines = append(lines, headerStr)
+	} else {
+		headerStr := styleHeader.Width(lw).Render(title)
+		lines = append(lines, headerStr)
+	}
+
+	listVH := vh - 1 // rows available for list (below header)
+	if m.groupedPicker {
+		lines = append(lines, m.leftGroupedRows(lw, listVH)...)
+	} else {
+		lines = append(lines, m.leftFlatRows(lw, listVH)...)
+	}
+
+	// Pad to fill height.
+	for len(lines) < vh {
+		lines = append(lines, strings.Repeat(" ", lw))
+	}
+	return strings.Join(lines[:vh], "\n")
+}
+
+// leftFlatRows renders the flat session list rows for the left pane.
+func (m model) leftFlatRows(lw, listVH int) []string {
+	var lines []string
+	total := len(m.slots)
+	for i := m.leftScroll; i < total && len(lines) < listVH; i++ {
+		slot := m.slots[i]
+		label := m.slotLabelShort(slot, lw-4)
+		prefix := "  "
+		if i == m.sessionIdx {
+			prefix = "● "
+		}
+		raw := fmt.Sprintf("%s%s", prefix, label)
+		if i == m.pickCursor && m.focusLeft {
+			lines = append(lines, stylePickSel.Width(lw).Render(raw))
+		} else if i == m.sessionIdx {
+			lines = append(lines, styleDim.Width(lw).Render(raw))
+		} else {
+			lines = append(lines, raw)
+		}
+	}
+	return lines
+}
+
+// leftGroupedRows renders the grouped session list rows for the left pane.
+func (m model) leftGroupedRows(lw, listVH int) []string {
+	var lines []string
+	for i := m.leftScroll; i < len(m.groupRows) && len(lines) < listVH; i++ {
+		row := m.groupRows[i]
+		selected := i == m.groupPickCursor && m.focusLeft
+		var raw string
+		switch row.kind {
+		case rowKindGroup:
+			sym := "▶"
+			if m.expandedGroups[row.cwd] {
+				sym = "▼"
+			}
+			raw = fmt.Sprintf("%s %s (%d)", sym, row.cwd, row.count)
+		case rowKindSession:
+			slot := m.slots[row.sessionIdx]
+			label := m.slotLabelShort(slot, lw-6)
+			marker := "  "
+			if row.sessionIdx == m.sessionIdx {
+				marker = "● "
+			}
+			raw = fmt.Sprintf("  %s%s", marker, label)
+		}
+		if selected {
+			lines = append(lines, stylePickSel.Width(lw).Render(raw))
+		} else if row.kind == rowKindGroup {
+			lines = append(lines, styleHeader.Width(lw).Render(raw))
+		} else {
+			lines = append(lines, raw)
+		}
+	}
+	return lines
+}
+
+// slotLabelShort returns a session label truncated to maxWidth runes.
+func (m model) slotLabelShort(slot *sessionSlot, maxWidth int) string {
+	ts := ""
+	if !slot.meta.StartTime.IsZero() {
+		ts = slot.meta.StartTime.Format("01-02 15:04")
+	}
+	if ts == "" {
+		ts = "unknown"
+	}
+	name := ""
+	if custom, ok := m.names[slot.meta.ID]; ok && custom != "" {
+		name = custom
+	} else {
+		name = slot.preview
+		if !slot.previewLoaded {
+			name = "…"
+		}
+		if name == "" {
+			name = slot.meta.ID
+			if len(name) > 16 {
+				name = name[:16]
+			}
+		}
+	}
+	full := fmt.Sprintf("[%s] %s", ts, name)
+	runes := []rune(full)
+	if maxWidth > 0 && len(runes) > maxWidth {
+		return string(runes[:maxWidth-1]) + "…"
+	}
+	return full
+}
+
+// rightPaneContent renders the conversation pane content (vh lines, rw columns wide).
+func (m model) rightPaneContent(rw, vh int) string {
+	end := m.cursor + vh
+	if end > len(m.items) {
+		end = len(m.items)
+	}
+
+	currentMatch := -1
+	if len(m.matches) > 0 && m.matchCursor < len(m.matches) {
+		currentMatch = m.matches[m.matchCursor]
+	}
+
+	lines := make([]string, 0, vh)
+	for i, it := range m.items[m.cursor:end] {
+		absIdx := m.cursor + i
+		line := it.text
+		if m.searchQuery != "" && strings.Contains(strings.ToLower(it.plain), strings.ToLower(m.searchQuery)) {
+			if absIdx == currentMatch {
+				line = styleMatch.Render(it.plain)
+			} else {
+				line = styleDim.Render(it.plain)
+			}
+		}
+		// Truncate to right pane width if needed.
+		if lipgloss.Width(line) > rw {
+			line = lipgloss.NewStyle().MaxWidth(rw).Render(line)
+		}
+		lines = append(lines, line)
+	}
+
+	for len(lines) < vh {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines[:vh], "\n")
 }
 
 func (m model) statusBar() string {
@@ -1537,6 +1823,13 @@ func (m model) statusBar() string {
 			statusPart = fmt.Sprintf("%s …", spinner)
 		}
 		hint = styleHelp.Render(fmt.Sprintf("/%s  %s  n next · N prev · / new search", m.searchQuery, statusPart))
+	} else if m.focusLeft {
+		// Left pane is focused — show left pane hints.
+		groupToggle := "Tab grouped"
+		if m.groupedPicker {
+			groupToggle = "Tab flat"
+		}
+		hint = styleHelp.Render(fmt.Sprintf("↑↓/jk select · Enter open · %s · n rename · d dup · Esc focus right", groupToggle))
 	} else {
 		viewLabel := ""
 		if m.showArchived {
@@ -1575,46 +1868,6 @@ func (m model) scrollPct() int {
 	return pct
 }
 
-func (m model) pickerView() string {
-	slots := m.slots
-	vh := m.viewHeight()
-
-	// Build picker lines.
-	lines := make([]string, 0, len(slots)+4)
-	title := styleHeader.Render(fmt.Sprintf("Sessions (%d)  ↑↓/jk navigate · n rename · Enter switch · Esc cancel", len(slots)))
-	lines = append(lines, title)
-	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 60))))
-	lines = append(lines, "")
-
-	// Visible window for the list.
-	visStart := 0
-	if m.pickCursor >= vh-4 {
-		visStart = m.pickCursor - (vh - 5)
-	}
-	if visStart < 0 {
-		visStart = 0
-	}
-
-	for i := visStart; i < len(slots) && i < visStart+(vh-4); i++ {
-		sl := m.slotLabel(slots[i])
-		label := fmt.Sprintf("  %2d  %s", i+1, sl)
-		if i == m.sessionIdx {
-			label = fmt.Sprintf("  %2d  %s  ←current", i+1, sl)
-		}
-		if i == m.pickCursor {
-			lines = append(lines, stylePickSel.Render(label))
-		} else {
-			lines = append(lines, label)
-		}
-	}
-
-	// Pad.
-	for len(lines) < vh {
-		lines = append(lines, "")
-	}
-
-	return strings.Join(lines[:vh], "\n") + "\n" + styleHelp.Render("press Esc to cancel")
-}
 
 // slotLabel returns a display string for the session picker using metadata
 // and the lazily-loaded preview. Shows "…" while the preview is loading.
@@ -1675,8 +1928,8 @@ func (m model) helpModalView() string {
 		{"A", "toggle live / archive view"},
 		{"u", "undo last archive / restore"},
 		{"w", "toggle live file watcher (auto-refresh)"},
-		{"s", "open flat session list"},
-		{"Tab", "open grouped session list"},
+		{"s", "focus left pane (flat session list)"},
+		{"Tab", "focus left pane (grouped session list)"},
 		{"/", "enter search mode"},
 		{"n / N", "next / previous search match (or rename when no search)"},
 		{"?", "close this help"},
@@ -1685,9 +1938,13 @@ func (m model) helpModalView() string {
 	listKeys := []entry{
 		{"↑ / k", "move cursor up"},
 		{"↓ / j", "move cursor down"},
+		{"g / Home", "go to top"},
+		{"G / End", "go to bottom"},
+		{"Tab", "toggle flat/grouped view"},
 		{"n", "rename selected session"},
-		{"Enter", "select session"},
-		{"Esc / q", "close list"},
+		{"d", "duplicate selected session"},
+		{"Enter", "select session and focus right pane"},
+		{"Esc / q", "return focus to right pane"},
 	}
 	searchKeys := []entry{
 		{"type", "add to query"},
@@ -1989,7 +2246,7 @@ func (m *model) renderMessage(idx int, msg *parser.Message) []item {
 
 	// Text content.
 	if text := strings.TrimSpace(msg.Text); text != "" {
-		wrapped := wordWrap(text, m.width-12) // leave room for indent
+		wrapped := wordWrap(text, m.rightPaneWidth()-12) // leave room for indent
 		for j, line := range strings.Split(wrapped, "\n") {
 			prefix := "        "
 			prefixPlain := "        "
@@ -2531,35 +2788,6 @@ func (m model) renderGroupRow(i int) string {
 	return ""
 }
 
-// groupedPickerView renders the grouped session list overlay.
-func (m model) groupedPickerView() string {
-	vh := m.viewHeight()
-	lines := make([]string, 0, vh)
-
-	title := styleHeader.Render(fmt.Sprintf("Sessions grouped by directory (%d)  Tab=flat · ←/→/Enter=expand · n rename · Esc cancel", len(m.slots)))
-	lines = append(lines, title)
-	lines = append(lines, styleBorder.Render(strings.Repeat("─", min(m.width-2, 70))))
-	lines = append(lines, "")
-
-	listHeight := vh - 4
-	visStart := 0
-	if m.groupPickCursor >= listHeight {
-		visStart = m.groupPickCursor - listHeight + 1
-	}
-	if visStart < 0 {
-		visStart = 0
-	}
-
-	for i := visStart; i < len(m.groupRows) && i < visStart+listHeight; i++ {
-		lines = append(lines, m.renderGroupRow(i))
-	}
-
-	for len(lines) < vh {
-		lines = append(lines, "")
-	}
-
-	return strings.Join(lines[:vh], "\n") + "\n" + styleHelp.Render("Tab flat view · Esc cancel")
-}
 
 // --------------------------------------------------------------------------
 // Misc helpers
